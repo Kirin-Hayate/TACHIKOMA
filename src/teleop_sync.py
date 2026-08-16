@@ -10,7 +10,7 @@ FOLLOWER_PORT = 'COM4'    # 追従側（フォロワー）が接続されてい�
 BAUDRATE = 1000000        # サーボモーターの通信速度（1Mbps）
 
 # 🧪 【試験用フィルタ】テストしたい関節のIDのみをリストに指定します
-TEST_IDS = [2]
+TEST_IDS = [1, 2, 3, 4, 5, 6]
 
 SERVO_IDS = [1, 2, 3, 4, 5, 6]
 DIRECTION = {1: 1, 2: 1, 3: 1, 4: 1, 5: 1, 6: 1}
@@ -18,34 +18,47 @@ DIRECTION = {1: 1, 2: 1, 3: 1, 4: 1, 5: 1, 6: 1}
 # ==========================================
 # 2. リーダー・フォロワーの可動範囲プロファイル
 # ==========================================
+# 物理調整により、フォロワー側の有限軸（ID1〜4, 6）はすべて 0/4095 境界跨ぎ無（f_cross: False）に統一
 JOINT_CONFIG = {
+    # ID1: リーダーは境界跨ぎ有（2850 -> 4095 -> 0 -> 1250: 連続値 2850〜5346）
     1: {
         "type": "bounded", 
         "r_min": 2850, "r_max": 4096 + 1400, "r_cross": True,
-        "f_min": 941,  "f_max": 3560,        "f_cross": False
+        "f_min": 850,  "f_max": 3400,        "f_cross": False,
+        "init": 2048
     },
+    # ID2: リーダーは境界跨ぎ有（1715 -> 4095 -> 0 -> 10: 連続値 1715〜4106）
     2: {
         "type": "bounded", 
-        "r_min": 1715, "r_max": 4096 + 10,   "r_cross": True,
-        "f_min": 1950, "f_max": 4096 + 200,  "f_cross": True
+        "r_min": 1715, "r_max": 4096 + 100,   "r_cross": True,
+        "f_min": 942,  "f_max": 3270,        "f_cross": False,
+        "init": 973
     },
+    # ID3: リーダー・フォロワーともに境界跨ぎ無
     3: {
         "type": "bounded", 
         "r_min": 900,  "r_max": 3100,       "r_cross": False,
-        "f_min": 3929, "f_max": 4096 + 2046, "f_cross": True
+        "f_min": 834,  "f_max": 3061,        "f_cross": False,
+        "init": 3061
     },
+    # ID4: リーダー・フォロワーともに境界跨ぎ無
     4: {
         "type": "bounded", 
         "r_min": 1650, "r_max": 4015,       "r_cross": False,
-        "f_min": 1780, "f_max": 4096 + 132,  "f_cross": True
+        "f_min": 735,  "f_max": 3214,        "f_cross": False,
+        "init": 735
     },
+    # ID5: 無限回転軸（差分・相対追従）
     5: {
-        "type": "infinite", "init": 1930
+        "type": "infinite", 
+        "init": 1023
     },
+    # ID6: リーダー・フォロワーともに境界跨ぎ無
     6: {
         "type": "bounded", 
         "r_min": 1990, "r_max": 3000,       "r_cross": False,
-        "f_min": 1837, "f_max": 3189,        "f_cross": False
+        "f_min": 1890, "f_max": 3152,        "f_cross": False,
+        "init": 1837
     },
 }
 
@@ -132,7 +145,7 @@ def calculate_target(sid, raw_leader, prev_raw_cache, follower_current_cache):
         if direction == -1:
             target_linear = f_min + (f_max_linear - target_linear)
             
-        target = int(target_linear) % 4096
+        target = int(max(200,min(3900, target_linear)))
         return target
 
     elif config["type"] == "infinite":
@@ -146,7 +159,8 @@ def calculate_target(sid, raw_leader, prev_raw_cache, follower_current_cache):
             
         current_target = follower_current_cache.get(sid, config["init"])
         new_target = current_target + (diff * direction)
-        return int(new_target)
+
+        return new_target
 
 
 # ==========================================
