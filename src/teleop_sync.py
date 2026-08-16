@@ -27,7 +27,7 @@ JOINT_CONFIG = {
     2: {
         "type": "bounded", 
         "r_min": 1715, "r_max": 4096 + 10,   "r_cross": True,
-        "f_min": 1929, "f_max": 4096 + 200,  "f_cross": True
+        "f_min": 1950, "f_max": 4096 + 200,  "f_cross": True
     },
     3: {
         "type": "bounded", 

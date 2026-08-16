@@ -6,7 +6,7 @@ import serial
 # ==========================================
 FOLLOWER_PORT = 'COM4'    # フォロワー側が接続されているシリアルポート
 BAUDRATE = 1000000        # サーボモーターの通信速度 (1Mbps)
-TARGET_ID = 3             # 動かすサーボのID
+TARGET_ID = 4             # 動かすサーボのID
 GOAL_POS = 2048           # 目標値 (中央: 2048)
 
 def set_torque(ser, servo_id, enable):

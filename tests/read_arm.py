@@ -1,7 +1,7 @@
 import time
 import serial
 
-PORT = 'COM3'
+PORT = 'COM4'
 BAUDRATE = 1000000
 
 def read_servo_positions():
