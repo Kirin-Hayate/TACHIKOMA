@@ -110,6 +110,44 @@ def set_torque(ser, servo_id, enable):
     ser.write(packet)
     time.sleep(0.002)
 
+def write_follower_speed(ser, servo_id, speed):
+    """
+    フォロワー側へ速度（Speed / Wheel Mode用）を書き込む
+    ※ Feetechサーボの速度制御レジスタ（通常アドレス 0x2E や 0x30 付近、または型番の仕様に合わせます）
+    ここでは安全に符号付き速度をパケット化して送信します。
+    """
+    # 速度の上下限クランプ（例: -1000 〜 1000）
+    speed = int(max(-1000, min(1000, speed)))
+    
+    addr = 0x2E       # 速度指令用レジスタアドレス（※STS3215等の仕様に合致させる）
+    length = 5
+    # 2バイトの符号付き整数（負数は2の補数表現）として分解
+    if speed < 0:
+        speed = 65536 + speed
+    speed_l = speed & 0xFF
+    speed_h = (speed >> 8) & 0xFF
+    
+    checksum = ~(servo_id + length + 0x03 + addr + speed_l + speed_h) & 0xFF
+    packet = bytes([0xFF, 0xFF, servo_id, length, 0x03, addr, speed_l, speed_h, checksum])
+    
+    ser.write(packet)
+    time.sleep(0.001)
+
+def set_servo_wheel_mode(ser, servo_id):
+    """
+    ID5を無限回転（速度制御モード / Wheel Mode）に設定する関数
+    ※ Feetechサーボの動作モードレジスタ（通常 0x21 あたり、またはメーカー仕様に準拠）
+    ※ RAM領域への書き込みなので電源OFFで元に戻る安全設計
+    """
+    addr = 0x21       # 動作モード設定レジスタの番地（※型番によって異なる場合がありますが一般的に0x21）
+    length = 4
+    mode_val = 3      # 3 または 1 が速度制御モード（ホイールモード）に相当
+    
+    checksum = ~(servo_id + length + 0x03 + addr + mode_val) & 0xFF
+    packet = bytes([0xFF, 0xFF, servo_id, length, 0x03, addr, mode_val, checksum])
+    
+    ser.write(packet)
+    time.sleep(0.005)
 
 # ==========================================
 # 4. 1:1 等倍マッピング変換ロジック
@@ -149,18 +187,20 @@ def calculate_target(sid, raw_leader, prev_raw_cache, follower_current_cache):
         return target
 
     elif config["type"] == "infinite":
-        prev_raw = prev_raw_cache.get(sid, raw_leader)
-        diff = raw_leader - prev_raw
-        
-        if diff > 2048:
-            diff -= 4096
-        elif diff < -2048:
-            diff += 4096
+            prev_raw = prev_raw_cache.get(sid, raw_leader)
+            diff = raw_leader - prev_raw
             
-        current_target = follower_current_cache.get(sid, config["init"])
-        new_target = current_target + (diff * direction)
-
-        return new_target
+            # 境界跨ぎの差分補正
+            if diff > 2048:
+                diff -= 4096
+            elif diff < -2048:
+                diff += 4096
+                
+            # 差分をそのまま速度指令値にスケーリング（ゲイン調整可能）
+            gain = 5.0  # 追従の敏感さ（お好みで調整）
+            speed_command = int(diff * direction * gain)
+            
+            return speed_command
 
 
 # ==========================================
@@ -183,6 +223,21 @@ def main():
         prev_leader_cache = {}
         follower_current_cache = {sid: JOINT_CONFIG[sid].get("init", 2048) for sid in SERVO_IDS}
 
+        # ポートオープン＆バッファクリアの後...
+        ser_leader.reset_input_buffer()
+        ser_follower.reset_input_buffer()
+
+        # 💡 【追加】ID5を速度制御モードに切り替えるパケットを送信
+        print("⚙️ ID5を速度制御モード（Wheel Mode）に設定中...")
+        set_servo_wheel_mode(ser_follower, 5)
+        time.sleep(0.1)
+
+        for sid in SERVO_IDS:
+            if sid in TEST_IDS:
+                set_torque(ser_follower, sid, True)
+            else:
+                set_torque(ser_follower, sid, False)        
+
         # 画面クリア
         sys.stdout.write("\033[2J")
         sys.stdout.flush()
@@ -191,26 +246,27 @@ def main():
             # カーソルを左上に固定して上書き描画
             output_buffer = "\033[H"
             output_buffer += "========================================\n"
-            output_buffer += " 🚀 テレアーム同期モニター (Ctrl+Cで終了)\n"
+            output_buffer += " Tele Operation Monitor (Ctrl+Cで終了)\n"
             output_buffer += "========================================\n"
-
             for sid in SERVO_IDS:
                 if sid in TEST_IDS:
                     # リーダーから生値を読み取る
                     raw_pos = read_servo_position(ser_leader, sid)
                     
                     if raw_pos is not None:
-                        # 目標値計算
-                        target_pos = calculate_target(sid, raw_pos, prev_leader_cache, follower_current_cache)
-                        # フォロワーへ書き込み
-                        write_follower_position(ser_follower, sid, target_pos)
+                        # 目標値（または速度値）の計算
+                        command_val = calculate_target(sid, raw_pos, prev_leader_cache, follower_current_cache)
+                        
+                        # 💡 ID5 とそれ以外の軸（ID1〜4, 6）で書き込み処理を分岐
+                        if sid == 5:
+                            write_follower_speed(ser_follower, sid, command_val)
+                            output_buffer += f" [ID {sid}]  Raw: {raw_pos:4d}  |  Speed: {command_val:4d}  |  Foll: (Velocity)\n"
+                        else:
+                            write_follower_position(ser_follower, sid, command_val)
+                            output_buffer += f" [ID {sid}]  Raw: {raw_pos:4d}  |  Target: {command_val:4d}  |  Foll: (Sync)\n"
                         
                         prev_leader_cache[sid] = raw_pos
-                        follower_current_cache[sid] = target_pos
-                        
-                        target_val = follower_current_cache[sid]
-                        # 💡 フォロワーの読取を廃止し、指令した Target 値を表示することで通信の競合・ちらつきを完全に排除
-                        output_buffer += f" [ID {sid}]  Raw: {raw_pos:4d}  |  Target: {target_val:4d}  |  Foll: (Sync)\n"
+                        follower_current_cache[sid] = command_val
                     else:
                         output_buffer += f" [ID {sid}]  Raw:  N/A   |  Target:  N/A   |  Foll: N/A\n"
                 else:
