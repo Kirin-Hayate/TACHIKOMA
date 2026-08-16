@@ -191,7 +191,7 @@ def main():
             # カーソルを左上に固定して上書き描画
             output_buffer = "\033[H"
             output_buffer += "========================================\n"
-            output_buffer += " 🚀 テレアーム同期モニター (Ctrl+Cで終了)\n"
+            output_buffer += " TACHIKOMA_teleoperaton mode (Ctrl+Cで終了)\n"
             output_buffer += "========================================\n"
 
             for sid in SERVO_IDS:
