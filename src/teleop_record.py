@@ -22,6 +22,7 @@ os.makedirs(MOTIONS_DIR, exist_ok=True)
 
 # 日時付きのデフォルトファイル名
 DEFAULT_FILENAME = f"motion_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+#DEFAULT_FILENAME = f"motion_B.csv"
 OUTPUT_FILEPATH = os.path.join(MOTIONS_DIR, DEFAULT_FILENAME)
 
 # ==========================================
