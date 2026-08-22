@@ -8,6 +8,7 @@ from datetime import datetime
 # ==========================================
 # 1. 通信設定・ファイル保存先設定
 # ==========================================
+RECORD_MODE = True       # 👈 True: 同期＋記録 / False: 同期のみ
 LEADER_PORT = 'COM3'      # 操作側（リーダー）のシリアルポート
 FOLLOWER_PORT = 'COM4'    # 追従側（フォロワー）のシリアルポート
 BAUDRATE = 1000000        # 通信速度（1Mbps）
@@ -162,11 +163,16 @@ def calculate_target(sid, raw_leader, prev_raw_cache, follower_current_cache):
 # 5. 同期＆記録メイン処理
 # ==========================================
 def main():
+    mode_title = "同期 ＆ モーション記録モード" if RECORD_MODE else "同期専用モード (記録OFF)"
     print("========================================")
-    print(" 🎬 TACHIKOMA 同期 ＆ モーション記録モード")
+    print(f" 🎬 TACHIKOMA {mode_title}")
     print("========================================")
-    print(f"📁 保存先: {OUTPUT_FILEPATH}")
+    if RECORD_MODE:
+        print(f"📁 保存先: {OUTPUT_FILEPATH}")
     print("👉 リーダーアームを操作してください。終了時は [Ctrl+C] を押してください。\n")
+
+    f = None
+    writer = None
 
     try:
         ser_leader = serial.Serial(LEADER_PORT, BAUDRATE, timeout=0.01)
@@ -183,74 +189,92 @@ def main():
         follower_current_cache = {sid: JOINT_CONFIG[sid].get("init", 2048) for sid in SERVO_IDS}
         last_valid_positions = {sid: 2048 for sid in SERVO_IDS}
 
-        with open(OUTPUT_FILEPATH, mode='w', newline='', encoding='utf-8') as f:
+        # 記録モード時のみCSVファイルをオープン
+        if RECORD_MODE:
+            f = open(OUTPUT_FILEPATH, mode='w', newline='', encoding='utf-8')
             writer = csv.writer(f)
-            # 再生コードと互換性のあるヘッダーを出力
             header = ["timestamp_sec"] + [f"id_{sid}" for sid in SERVO_IDS]
             writer.writerow(header)
 
-            start_time = time.time()
-            interval = 1.0 / SAMPLING_RATE_HZ
-            frame_count = 0
+        start_time = time.time()
+        interval = 1.0 / SAMPLING_RATE_HZ
+        frame_count = 0
+        first_draw = True
 
-            # 画面クリア
-            sys.stdout.write("\033[2J")
-            sys.stdout.flush()
+        # 画面のちらつき防止のためカーソルを非表示
+        sys.stdout.write("\033[?25l")
+        sys.stdout.flush()
 
-            while True:
-                loop_start = time.time()
-                current_timestamp = loop_start - start_time
+        while True:
+            loop_start = time.time()
+            current_timestamp = loop_start - start_time
 
-                current_csv_row = [f"{current_timestamp:.4f}"]
-                output_buffer = "\033[H"
-                output_buffer += "========================================\n"
-                output_buffer += f" ⏱️ 記録中: {current_timestamp:6.2f}s [{frame_count:5d} frames]\n"
-                output_buffer += f" 📁 {os.path.basename(OUTPUT_FILEPATH)}\n"
-                output_buffer += "========================================\n"
+            current_csv_row = [f"{current_timestamp:.4f}"] if RECORD_MODE else []
+            mode_label = "記録中" if RECORD_MODE else "同期中"
+            
+            lines = []
+            lines.append("========================================")
+            lines.append(f" ⏱️ 状態: {mode_label}  {current_timestamp:5.2f}s [{frame_count:5d} frames]")
+            if RECORD_MODE:
+                lines.append(f" 📁 {os.path.basename(OUTPUT_FILEPATH)}")
+            lines.append("========================================")
 
-                for sid in SERVO_IDS:
-                    raw_pos = read_servo_position(ser_leader, sid)
-                    
-                    if raw_pos is not None:
-                        last_valid_positions[sid] = raw_pos
+            for sid in SERVO_IDS:
+                raw_pos = read_servo_position(ser_leader, sid)
+                
+                if raw_pos is not None:
+                    last_valid_positions[sid] = raw_pos
 
-                    # 記録用生値
-                    current_raw = last_valid_positions[sid]
+                current_raw = last_valid_positions[sid]
+                if RECORD_MODE:
                     current_csv_row.append(current_raw)
 
-                    # フォロワー同期制御
-                    if sid in TEST_IDS and raw_pos is not None:
-                        target_pos = calculate_target(sid, current_raw, prev_leader_cache, follower_current_cache)
-                        write_follower_position(ser_follower, sid, target_pos)
+                # フォロワー同期制御
+                if sid in TEST_IDS and raw_pos is not None:
+                    target_pos = calculate_target(sid, current_raw, prev_leader_cache, follower_current_cache)
+                    write_follower_position(ser_follower, sid, target_pos)
 
-                        prev_leader_cache[sid] = current_raw
-                        follower_current_cache[sid] = target_pos
-                        output_buffer += f" [ID {sid}]  Raw: {current_raw:4d}  |  Target: {target_pos:4d}  |  (Sync)\n"
-                    else:
-                        output_buffer += f" [ID {sid}]  Raw: {current_raw:4d}  |  (OFF)\n"
+                    prev_leader_cache[sid] = current_raw
+                    follower_current_cache[sid] = target_pos
+                    lines.append(f" [ID {sid}]  Raw: {current_raw:4d}  |  Target: {target_pos:4d}  |  (Sync)")
+                else:
+                    lines.append(f" [ID {sid}]  Raw: {current_raw:4d}  |  (OFF)")
 
-                # CSVへ書き込み
+            lines.append("========================================")
+            lines.append(" [Ctrl+C] で停止して終了")
+
+            # 2回目以降のループでは、前回出力した行数分だけカーソルを上に戻して上書き
+            if not first_draw:
+                sys.stdout.write(f"\033[{len(lines)}A")
+            else:
+                first_draw = False
+
+            # 各行を行末クリアしながら出力
+            sys.stdout.write("\n".join(line + "\033[K" for line in lines) + "\n")
+            sys.stdout.flush()
+
+            # 記録モード時のみCSVへ書き込み
+            if RECORD_MODE and writer:
                 writer.writerow(current_csv_row)
-                frame_count += 1
+            frame_count += 1
 
-                output_buffer += "========================================\n"
-                output_buffer += " [Ctrl+C] で記録を保存して終了\n"
-
-                sys.stdout.write(output_buffer)
-                sys.stdout.flush()
-
-                # 50Hz周期を維持
-                elapsed = time.time() - loop_start
-                sleep_time = interval - elapsed
-                if sleep_time > 0:
-                    time.sleep(sleep_time)
+            # 50Hz周期を維持
+            elapsed = time.time() - loop_start
+            sleep_time = interval - elapsed
+            if sleep_time > 0:
+                time.sleep(sleep_time)
 
     except KeyboardInterrupt:
-        print("\n\n🛑 記録を停止しました。フォロワーのトルクをOFFにします。")
-        print(f"📁 計 {frame_count} フレームを '{OUTPUT_FILEPATH}' に保存しました。")
+        sys.stdout.write("\033[?25h\n\n🛑 停止しました。フォロワーのトルクをOFFにします。\n")
+        if RECORD_MODE:
+            print(f"📁 計 {frame_count} フレームを '{OUTPUT_FILEPATH}' に保存しました。")
     except Exception as e:
+        sys.stdout.write("\033[?25h")
         print(f"\n❌ エラー: {e}")
     finally:
+        sys.stdout.write("\033[?25h")  # カーソルを確実に再表示
+        if f is not None and not f.closed:
+            f.close()
         if 'ser_follower' in locals() and ser_follower.is_open:
             for sid in SERVO_IDS:
                 set_torque(ser_follower, sid, False)
