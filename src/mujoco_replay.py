@@ -9,7 +9,7 @@ import mujoco.viewer
 # ==========================================
 # 1. 設定・マッピング定義
 # ==========================================
-CSV_FILENAME = "modelmotion_mometohome.csv"  # 再生したいCSVファイル名
+CSV_FILENAME = "時計からの反時計.csv"  # 再生したいCSVファイル名
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CSV_PATH = os.path.join(BASE_DIR, "motions", CSV_FILENAME)
@@ -37,7 +37,7 @@ SIM_OFFSETS = {
     2: 973,   # Shoulder: 折りたたみ下限初期位置
     3: 3061,  # Elbow: 屈曲初期位置
     4: (735+4001)/2,   # Wrist Pitch: 初期位置
-    5: 1023,  # Wrist Roll: 初期回転角
+    5: 3050,  # Wrist Roll: 初期回転角
     6: 1837,  # Gripper: 閉初期位置
 }
 
