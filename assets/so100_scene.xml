@@ -1,0 +1,90 @@
+<mujoco model="so100_scene">
+  <compiler angle="radian" meshdir="assets" autolimits="true"/>
+
+  <visual>
+    <!-- 目に優しい落ち着いたライティング -->
+    <headlight ambient="0.45 0.45 0.45" diffuse="0.6 0.6 0.6" specular="0.1 0.1 0.1"/>
+    <!-- 背景グラデーションと同調する霞色 -->
+    <rgba haze="0.18 0.18 0.2 1"/>
+    <global offwidth="1920" offheight="1080"/>
+  </visual>
+
+  <asset>
+    <!-- ダークグレー系の目に優しいスタジオ背景 -->
+    <texture type="skybox" builtin="gradient" rgb1="0.25 0.26 0.28" rgb2="0.12 0.12 0.14" width="512" height="512"/>
+    <!-- シックなグリッド床面 -->
+    <texture name="grid" type="2d" builtin="checker" width="512" height="512" rgb1="0.18 0.18 0.2" rgb2="0.22 0.22 0.24"/>
+    <material name="grid_mat" texture="grid" texrepeat="10 10" reflectance="0.05"/>
+
+    <!-- マテリアルカラー定義 -->
+    <material name="white_print" rgba="0.88 0.88 0.88 1.0" specular="0.3" shininess="0.3"/>
+    <material name="servo_mat" rgba="0.18 0.38 0.75 1.0" specular="0.6" shininess="0.5"/>
+
+    <!-- メッシュ定義一式（ファイル名と完全一致） -->
+    <mesh name="base_mesh" file="Base.stl"/>
+    <mesh name="base_motor_mesh" file="Base_Motor.stl"/>
+    <mesh name="rot_pitch_mesh" file="Rotation_Pitch.stl"/>
+    <mesh name="rot_pitch_motor_mesh" file="Rotation_Pitch_Motor.stl"/>
+    <mesh name="upper_arm_mesh" file="Upper_Arm.stl"/>
+    <mesh name="upper_arm_motor_mesh" file="Upper_Arm_Motor.stl"/>
+    <mesh name="lower_arm_mesh" file="Lower_Arm.stl"/>
+    <mesh name="lower_arm_motor_mesh" file="Lower_Arm_Motor.stl"/>
+    <mesh name="wrist_mesh" file="Wrist_Pitch_Roll.stl"/>
+    <mesh name="wrist_motor_mesh" file="Wrist_Pitch_Roll_Motor.stl"/>
+    <mesh name="fixed_jaw_mesh" file="Fixed_Jaw.stl"/>
+    <mesh name="fixed_jaw_motor_mesh" file="Fixed_Jaw_Motor.stl"/>
+    <mesh name="moving_jaw_mesh" file="Moving_Jaw.stl"/>
+  </asset>
+
+  <worldbody>
+    <light pos="0 -0.6 1.8" dir="0 0.3 -1" directional="true"/>
+    <geom name="floor" type="plane" size="1.5 1.5 0.05" material="grid_mat"/>
+
+    <!-- Base -->
+    <body name="base" pos="0 0 0">
+      <geom type="mesh" mesh="base_mesh" material="white_print"/>
+      <geom type="mesh" mesh="base_motor_mesh" material="servo_mat"/>
+
+      <!-- Shoulder (Joint 1) -->
+      <body name="shoulder" pos="0 -0.0452 0.0165" euler="1.57079 0 0">
+        <joint name="shoulder_pan" type="hinge" axis="0 1 0" range="-2 2"/>
+        <geom type="mesh" mesh="rot_pitch_mesh" material="white_print"/>
+        <geom type="mesh" mesh="rot_pitch_motor_mesh" material="servo_mat"/>
+
+        <!-- Upper Arm (Joint 2) -->
+        <body name="upper_arm" pos="0 0.1025 0.0306" euler="-1.8 0 0">
+          <joint name="shoulder_lift" type="hinge" axis="1 0 0" range="0 3.5"/>
+          <geom type="mesh" mesh="upper_arm_mesh" material="white_print"/>
+          <geom type="mesh" mesh="upper_arm_motor_mesh" material="servo_mat"/>
+
+          <!-- Lower Arm (Joint 3) -->
+          <body name="lower_arm" pos="0 0.11257 0.028" euler="1.57079 0 0">
+            <joint name="elbow_flex" type="hinge" axis="1 0 0" range="-3.14158 0"/>
+            <geom type="mesh" mesh="lower_arm_mesh" material="white_print"/>
+            <geom type="mesh" mesh="lower_arm_motor_mesh" material="servo_mat"/>
+
+            <!-- Wrist (Joint 4) -->
+            <body name="wrist" pos="0 0.0052 0.1349" euler="-1 0 0">
+              <joint name="wrist_flex" type="hinge" axis="1 0 0" range="-2.5 1.2"/>
+              <geom type="mesh" mesh="wrist_mesh" material="white_print"/>
+              <geom type="mesh" mesh="wrist_motor_mesh" material="servo_mat"/>
+
+              <!-- Gripper (Joint 5) -->
+              <body name="gripper" pos="0 -0.0601 0" euler="0 1.57079 0">
+                <joint name="wrist_roll" type="hinge" axis="0 1 0" range="-3.14158 3.14158"/>
+                <geom type="mesh" mesh="fixed_jaw_mesh" material="white_print"/>
+                <geom type="mesh" mesh="fixed_jaw_motor_mesh" material="servo_mat"/>
+
+                <!-- Jaw (Joint 6) -->
+                <body name="jaw" pos="-0.0202 -0.0244 0" euler="0 3.14158 0">
+                  <joint name="gripper_jaw" type="hinge" axis="0 0 1" range="-0.2 2.0"/>
+                  <geom type="mesh" mesh="moving_jaw_mesh" material="white_print"/>
+                </body>
+              </body>
+            </body>
+          </body>
+        </body>
+      </body>
+    </body>
+  </worldbody>
+</mujoco>
