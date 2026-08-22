@@ -9,7 +9,7 @@ import mujoco.viewer
 # ==========================================
 # 1. 設定・マッピング定義
 # ==========================================
-CSV_FILENAME = "時計からの反時計.csv"  # 再生したいCSVファイル名
+CSV_FILENAME = "motion_20260822_221201.csv"  # 再生したいCSVファイル名
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CSV_PATH = os.path.join(BASE_DIR, "motions", CSV_FILENAME)
