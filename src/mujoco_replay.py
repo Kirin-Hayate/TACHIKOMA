@@ -9,7 +9,7 @@ import mujoco.viewer
 # ==========================================
 # 1. 設定・マッピング定義
 # ==========================================
-CSV_FILENAME = "motion_20260822_221201.csv"  # 再生したいCSVファイル名
+CSV_FILENAME = "motion_20260822_221201.csv"  # 再生したいCSVファイル名[cite: 13]
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CSV_PATH = os.path.join(BASE_DIR, "motions", CSV_FILENAME)
@@ -17,7 +17,7 @@ CSV_PATH = os.path.join(BASE_DIR, "motions", CSV_FILENAME)
 SERVO_IDS = [1, 2, 3, 4, 5, 6]
 DIRECTION = {1: 1, 2: 1, 3: 1, 4: 1, 5: 1, 6: 1}
 
-# teleop_replay.py と完全一致させたフォロワー制御プロファイル
+# teleop_replay.py と完全一致させたフォロワー制御プロファイル[cite: 13]
 JOINT_CONFIG = {
     1: {"type": "bounded", "r_min": 2850, "r_max": 4096 + 1400, "r_cross": True,  "f_min": 850,  "f_max": 3400, "f_cross": False, "init": 2130},
     2: {"type": "bounded", "r_min": 1715, "r_max": 4096 + 100,  "r_cross": True,  "f_min": 942,  "f_max": 3270, "f_cross": False, "init": 973},
@@ -30,32 +30,28 @@ JOINT_CONFIG = {
 # ==========================================
 # 2. MuJoCoモデル整合用パラメータ
 # ==========================================
-# MuJoCoのモデル（so100_scene.xml）の 0 rad 姿勢に対応するフォロワーのRawカウント値
-# フォロワーの基準初期姿勢（Home）をそのままゼロ点としてマッピング
 SIM_OFFSETS = {
-    1: 2130,  # Base: 初期中心位置
-    2: 973,   # Shoulder: 折りたたみ下限初期位置
-    3: 3061,  # Elbow: 屈曲初期位置
-    4: (735+4001)/2,   # Wrist Pitch: 初期位置
-    5: 3050,  # Wrist Roll: 初期回転角
-    6: 1837,  # Gripper: 閉初期位置
+    1: 2130,             # Base: 初期中心位置[cite: 13]
+    2: 973,              # Shoulder: 折りたたみ下限初期位置[cite: 13]
+    3: 3061,             # Elbow: 屈曲初期位置[cite: 13]
+    4: (735 + 4001) / 2, # Wrist Pitch: 中立位置[cite: 13]
+    5: 3050,             # Wrist Roll: 初期回転角[cite: 13]
+    6: 1837,             # Gripper: 閉初期位置[cite: 13]
 }
 
-# MuJoCoの回転軸（Joint Axis）と実機サーボの増減方向の符号合わせ
 SIM_DIRECTIONS = {
     1: -1.0,
     2:  1.0,
-    3:  1.0,  # 肘関節（値増加で曲がる実機とMuJoCoの正方向の整合）
+    3:  1.0,
     4:  1.0,
     5:  1.0,
     6:  1.0,
 }
 
 # ==========================================
-# 3. 角度計算ヘルパー（実機再現）
+# 3. 角度計算ヘルパー
 # ==========================================
 def calculate_target(sid, raw_leader, prev_raw_cache, follower_current_cache):
-    """teleop_replay.py と全く同じ目標値計算[cite: 7]"""
     config = JOINT_CONFIG[sid]
     direction = DIRECTION[sid]
 
@@ -94,15 +90,12 @@ def calculate_target(sid, raw_leader, prev_raw_cache, follower_current_cache):
 
         current_target = follower_current_cache.get(sid, config["init"])
         new_target = current_target + (diff * direction)
-        return int(new_target) % 4096
+        return new_target  # 剰余を外して連続値を保持
 
 
 def raw_to_radian(sid, target_val):
-    """フォロワーTarget目標値（0〜4095）をMuJoCo用のラジアン角に精密変換"""
     offset = SIM_OFFSETS.get(sid, 2048)
     direction = SIM_DIRECTIONS.get(sid, 1.0)
-    
-    # 4096 = 2π rad
     diff = (target_val - offset) * direction
     return diff * (2.0 * math.pi / 4096.0)
 
@@ -134,47 +127,96 @@ def main():
     model = mujoco.MjModel.from_xml_path(xml_path)
     data = mujoco.MjData(model)
 
-    # 実機と同様のキャッシュ初期化
-    prev_leader_cache = {}
-    follower_current_cache = {sid: JOINT_CONFIG[sid]["init"] for sid in SERVO_IDS}
+    # 制御用ステート
+    state = {
+        "paused": False,
+        "reset_requested": False,
+        "loop_mode": False,
+    }
 
-    print("🚀 MuJoCo ビューアを起動します。Spaceキーでポーズ/再開、マウスドラッグで視点変更が可能です。")
+    def key_callback(keycode):
+        # Spaceキー: 一時停止 / 再開
+        if keycode == 32:
+            state["paused"] = not state["paused"]
+            status = "⏸️ 一時停止" if state["paused"] else "▶️ 再生再開"
+            print(f"\n[{status}]")
+        # Rキー: 最初からリプレイ
+        elif keycode in (82, 114):  # 'R', 'r'
+            state["reset_requested"] = True
+            print("\n🔄 最初から再生します")
+        # Lキー: ループ再生の切り替え
+        elif keycode in (76, 108):  # 'L', 'l'
+            state["loop_mode"] = not state["loop_mode"]
+            loop_str = "ON" if state["loop_mode"] else "OFF"
+            print(f"\n🔁 ループ再生: {loop_str}")
 
-    with mujoco.viewer.launch_passive(model, data) as viewer:
-        playback_start = time.time()
-        frame_idx = 0
+    print("==================================================")
+    print(" 🚀 操作キー一覧:")
+    print("   [Space] : 一時停止 / 再生")
+    print("   [R]     : 最初からリプレイ")
+    print("   [L]     : ループ再生 ON / OFF")
+    print("==================================================")
 
-        while viewer.is_running() and frame_idx < len(frames):
-            t_target, raw_positions = frames[frame_idx]
-
-            # 実機と同じ実時間同期
-            elapsed = time.time() - playback_start
-            if elapsed < t_target:
-                time.sleep(0.001)
-                continue
-
-            # 各軸の目標値を計算し、MuJoCoの関節へ流し込む
-            for i, sid in enumerate(SERVO_IDS):
-                raw_val = raw_positions[sid]
-                target_val = calculate_target(sid, raw_val, prev_leader_cache, follower_current_cache)
-                prev_leader_cache[sid] = raw_val
-                follower_current_cache[sid] = target_val
-
-                rad = raw_to_radian(sid, target_val)
-                if i < model.nq:
-                    data.qpos[i] = rad
-
-            mujoco.mj_forward(model, data)
-            viewer.sync()
-
-            sys.stdout.write(f"\r⏱️ 再生中: {t_target:6.2f}s / {frames[-1][0]:6.2f}s [Frame {frame_idx + 1}/{len(frames)}]")
-            sys.stdout.flush()
-
-            frame_idx += 1
-
-        print("\n✅ シミュレーション再生が完了しました。")
+    with mujoco.viewer.launch_passive(model, data, key_callback=key_callback) as viewer:
         while viewer.is_running():
-            time.sleep(0.1)
+            # キャッシュ・再生開始時刻の初期化
+            prev_leader_cache = {}
+            follower_current_cache = {sid: JOINT_CONFIG[sid]["init"] for sid in SERVO_IDS}
+            frame_idx = 0
+            state["reset_requested"] = False
+            playback_start = time.time()
+            total_duration = frames[-1][0]
+
+            while viewer.is_running() and frame_idx < len(frames):
+                # リセット要求が来たらループを抜けて最初から再スタート
+                if state["reset_requested"]:
+                    break
+
+                # 一時停止中の処理（時間を進めない）
+                if state["paused"]:
+                    time.sleep(0.02)
+                    playback_start = time.time() - frames[frame_idx][0]
+                    viewer.sync()
+                    continue
+
+                t_target, raw_positions = frames[frame_idx]
+
+                # 実時間同期
+                elapsed = time.time() - playback_start
+                if elapsed < t_target:
+                    time.sleep(0.001)
+                    continue
+
+                # 目標値計算・代入
+                for i, sid in enumerate(SERVO_IDS):
+                    raw_val = raw_positions[sid]
+                    target_val = calculate_target(sid, raw_val, prev_leader_cache, follower_current_cache)
+                    prev_leader_cache[sid] = raw_val
+                    follower_current_cache[sid] = target_val
+
+                    rad = raw_to_radian(sid, target_val)
+                    if i < model.nq:
+                        data.qpos[i] = rad
+
+                mujoco.mj_forward(model, data)
+                viewer.sync()
+
+                loop_text = "[Loop: ON]" if state["loop_mode"] else "[Loop: OFF]"
+                sys.stdout.write(f"\r⏱️ 再生中: {t_target:6.2f}s / {total_duration:6.2f}s [Frame {frame_idx + 1}/{len(frames)}] {loop_text}  ")
+                sys.stdout.flush()
+
+                frame_idx += 1
+
+            # 1回の再生が終了したときの処理
+            if not state["reset_requested"]:
+                if state["loop_mode"]:
+                    time.sleep(0.3)
+                    continue
+                else:
+                    print("\n✅ シミュレーション再生が完了しました。[R]キーで再再生、[Space]で一時停止を解除できます。")
+                    # 再生終了後はビューアを開いたまま待機し、Rキー押下で再ループ
+                    while viewer.is_running() and not state["reset_requested"]:
+                        time.sleep(0.05)
 
 
 if __name__ == "__main__":

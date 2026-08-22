@@ -8,7 +8,7 @@ from datetime import datetime
 # ==========================================
 # 1. 通信設定・ファイル保存先設定
 # ==========================================
-RECORD_MODE = True       # 👈 True: 同期＋記録 / False: 同期のみ
+RECORD_MODE = False       # 👈 True: 同期＋記録 / False: 同期のみ
 LEADER_PORT = 'COM3'      # 操作側（リーダー）のシリアルポート
 FOLLOWER_PORT = 'COM4'    # 追従側（フォロワー）のシリアルポート
 BAUDRATE = 1000000        # 通信速度（1Mbps）
