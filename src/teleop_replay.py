@@ -10,7 +10,7 @@ import os
 # 実行したいモーションファイルと再生回数をリストで指定
 # [ ["ファイル名.csv", 再生回数], ... ]
 MOTION_SEQUENCE = [
-    ["motion_20260816_232938.csv", 1]
+    ["時計からの反時計.csv", 1]
 ]
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -125,7 +125,7 @@ def calculate_target(sid, raw_leader, prev_raw_cache, follower_current_cache):
 
         current_target = follower_current_cache.get(sid, config["init"])
         new_target = current_target + (diff * direction)
-        return int(new_target) % 4096
+        return new_target
 
 
 def smooth_move_follower(ser, start_positions, target_positions, duration=2.0, steps=60):
