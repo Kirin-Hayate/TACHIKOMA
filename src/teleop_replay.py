@@ -10,7 +10,7 @@ import os
 # 実行したいモーションファイルと再生回数をリストで指定
 # [ ["ファイル名.csv", 再生回数], ... ]
 MOTION_SEQUENCE = [
-    ["motion_20260816_225713.csv", 1],
+    ["motion_20260816_232938.csv", 1]
 ]
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
