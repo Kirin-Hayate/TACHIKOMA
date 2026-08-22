@@ -35,7 +35,7 @@ JOINT_CONFIG = {
         "type": "bounded", 
         "r_min": 2850, "r_max": 4096 + 1400, "r_cross": True,
         "f_min": 850,  "f_max": 3400,        "f_cross": False,
-        "init": 2048
+        "init": 2500
     },
     2: {
         "type": "bounded", 
@@ -155,7 +155,7 @@ def calculate_target(sid, raw_leader, prev_raw_cache, follower_current_cache):
             
         current_target = follower_current_cache.get(sid, config["init"])
         new_target = current_target + (diff * direction)
-        return int(new_target) % 4096
+        return new_target  # ⭕ teleop_sync.py と同様に剰余を外して連続値を返す
 
 
 # ==========================================
