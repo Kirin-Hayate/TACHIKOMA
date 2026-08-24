@@ -8,6 +8,12 @@ TACHIKOMA 統合遠隔操作スクリプト (src/teleop_main.py)
   2. 画面上の3D描画       （デフォルト: OFF / 有効化: --sim）
   3. 動作データのCSV記録  （デフォルト: OFF / 有効化: --record）
 
+【安全機能】
+- 起動時アプローチ補間（急発進防止）:
+  メインループ開始前に、トルクOFF状態で実機フォロワーの現在姿勢を読み取り、
+  リーダーアームの初期姿勢へ「コサインS字補間（初速0）」でゆっくり移動してから
+  50Hzのリアルタイム遠隔操作へ移行します。
+
 【実行コマンド例】
   - 画面シミュレーションのみ（安全なテスト用）
       python src/teleop_main.py --sim
@@ -24,6 +30,7 @@ import sys
 import time
 import csv
 import os
+import math
 import argparse
 from datetime import datetime
 
@@ -45,6 +52,9 @@ from config.joint_config import (
 from core.sts3215 import STS3215Driver
 from core.kinematics import calculate_target
 from core.sim_viewer import MujocoSimViewer
+
+# 起動時にリーダーの姿勢へ合わせる秒数
+STARTUP_APPROACH_DURATION = 2.5
 
 
 # ==============================================================================
@@ -81,12 +91,41 @@ def parse_arguments():
 
 
 # ==============================================================================
-# 3. メイン処理
+# 3. 補助関数 (安全なS字補間)
+# ==============================================================================
+def smooth_move(follower_driver, sim_viewer, start_positions, target_positions, duration=2.5, steps=75):
+    """
+    開始姿勢から目標姿勢へコサインS字加減速で滑らかに移動する。
+    初速と終速がゼロになるため、モーターへの過負荷や急発進が起きません。
+    """
+    interval = duration / steps
+    for step in range(1, steps + 1):
+        t = step / steps
+        ratio = (1.0 - math.cos(t * math.pi)) / 2.0
+
+        current_step_positions = {}
+        for sid in SERVO_IDS:
+            start_p = start_positions.get(sid, JOINT_CONFIG[sid]["init"])
+            target_p = target_positions.get(sid, JOINT_CONFIG[sid]["init"])
+            current_p = int(start_p + ratio * (target_p - start_p))
+            current_step_positions[sid] = current_p
+
+            if follower_driver is not None:
+                follower_driver.write_position(sid, current_p)
+
+        if sim_viewer is not None:
+            sim_viewer.update_joints(current_step_positions)
+
+        time.sleep(interval)
+
+
+# ==============================================================================
+# 4. メイン処理
 # ==============================================================================
 def main():
     args = parse_arguments()
 
-    # 引数から各機能の有効/無効フラグを決定（すべて明示指定で ON になる設計）
+    # 引数から各機能の有効/無効フラグを決定
     enable_follower = args.arm
     enable_sim = args.sim
     enable_record = args.record
@@ -119,9 +158,6 @@ def main():
         output_filepath = os.path.join(motions_dir, filename)
         print(f"📁 記録先: {output_filepath}")
 
-    print("👉 リーダーアームを操作してください。")
-    print("👉 終了時は [Ctrl+C] または ウィンドウを閉じてください。\n")
-
     leader = None
     follower = None
     sim = None
@@ -139,8 +175,6 @@ def main():
     if enable_follower:
         try:
             follower = STS3215Driver(FOLLOWER_PORT, baudrate=BAUDRATE, timeout=0.01)
-            for sid in SERVO_IDS:
-                follower.set_torque(sid, True)
             is_follower_active = True
             print(f"✅ 実機フォロワー接続完了 ({FOLLOWER_PORT})")
         except Exception as e:
@@ -156,7 +190,6 @@ def main():
             print("✅ 3Dシミュレータ初期化完了")
         except Exception as e:
             print(f"⚠️ 3Dシミュレータ初期化失敗: {e}")
-            print("👉 3D描画はスキップします。")
             sim = None
     else:
         print("💡 --sim が指定されていないため、3D画面描画はスキップします。")
@@ -173,6 +206,53 @@ def main():
     follower_current_cache = {sid: JOINT_CONFIG[sid].get("init", 2048) for sid in SERVO_IDS}
     last_valid_positions = {sid: 2048 for sid in SERVO_IDS}
 
+    # --------------------------------------------------------------------------
+    # 🛡️ 【解決策1】起動時アプローチ補間（現在姿勢 ➔ リーダー初期姿勢）
+    # --------------------------------------------------------------------------
+    print("\n🔍 リーダーおよびフォロワーの初期姿勢をスキャン中...")
+    initial_leader_raw = {}
+    initial_targets = {}
+    follower_startup_pos = {}
+
+    # リーダーの現在姿勢を全軸読み取り
+    for sid in SERVO_IDS:
+        pos = leader.read_position(sid)
+        initial_leader_raw[sid] = pos if pos is not None else 2048
+        last_valid_positions[sid] = initial_leader_raw[sid]
+
+    # リーダー初期姿勢に対応するフォロワー目標値を計算
+    for sid in SERVO_IDS:
+        target_val = calculate_target(sid, initial_leader_raw[sid], prev_leader_cache, follower_current_cache)
+        initial_targets[sid] = target_val
+        prev_leader_cache[sid] = initial_leader_raw[sid]
+        follower_current_cache[sid] = target_val
+
+    # 実機フォロワーの静止姿勢をスキャン（トルクOFF安全状態）
+    if is_follower_active:
+        for sid in SERVO_IDS:
+            pos = follower.read_position(sid)
+            follower_startup_pos[sid] = pos if pos is not None else initial_targets[sid]
+        
+        # 読み取った角度を保持した状態でトルクON
+        for sid in SERVO_IDS:
+            follower.write_position(sid, follower_startup_pos[sid])
+            follower.set_torque(sid, True)
+    else:
+        follower_startup_pos = dict(initial_targets)
+
+    # 3Dモデル画面を初期姿勢に同期
+    if sim is not None:
+        sim.update_joints(follower_startup_pos)
+
+    # S字補間でリーダーの現在姿勢へゆっくりアプローチ
+    if is_follower_active or sim is not None:
+        print(f"🎯 フォロワーをリーダーの現在姿勢へ同期中 ({STARTUP_APPROACH_DURATION}秒)...")
+        smooth_move(follower, sim, follower_startup_pos, initial_targets, duration=STARTUP_APPROACH_DURATION)
+        print("✅ 同期完了！リアルタイム遠隔操作を開始します。\n")
+
+    print("👉 リーダーアームを操作してください。")
+    print("👉 終了時は [Ctrl+C] または ウィンドウを閉じてください。\n")
+
     start_time = time.time()
     interval = 1.0 / SAMPLING_RATE_HZ  # 50Hz = 0.02秒
     frame_count = 0
@@ -183,7 +263,7 @@ def main():
     sys.stdout.flush()
 
     try:
-        # メインループ関数
+        # メインループ関数 (50Hzリアルタイム制御)
         def run_loop():
             nonlocal frame_count, first_draw
             while True:
