@@ -1,0 +1,10 @@
+# 環境変数・APIキー設定ファイル（絶対にGitHubに上げない）
+.env
+.env.local
+.env.*.local
+
+# Pythonのキャッシュや仮想環境
+__pycache__/
+*.py[cod]
+.venv/
+venv/
