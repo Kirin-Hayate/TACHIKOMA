@@ -79,15 +79,15 @@ JOINT_CONFIG = {
     # ID 5: 手首ロール (Wrist Roll: 相対追従・無限回転)
     5: {
         "type": "infinite",
-        "init": 965,  # 初期回転角 
+        "init": 1028,  # 初期回転角 
     },
 
     # ID 6: グリッパー開閉 (Gripper)
     6: {
         "type": "bounded",
         "r_min": 1990, "r_max": 3000,        "r_cross": False,
-        "f_min": 1890, "f_max": 3152,        "f_cross": False,
-        "init": 1837,  # 閉初期位置 
+        "f_min": 1891, "f_max": 2833,        "f_cross": False,
+        "init": 1891,  # 閉初期位置 
     },
 } 
 
