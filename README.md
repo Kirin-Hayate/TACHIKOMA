@@ -59,6 +59,5 @@ TACHIKOMA/
 │   ├── teleop_main.py       # リアルタイム遠隔操作・記録統合スクリプト
 │   ├── replay_main.py       # モーション自動再生スクリプト
 │   └── tachikoma_agent_1.py   # 自然言語対話・プレビュー・実機承認実行エージェント
-├── .env.example             # API キー設定用サンプルファイル
 ├── requirements.txt         # 依存ライブラリ一覧
 └── README.md
