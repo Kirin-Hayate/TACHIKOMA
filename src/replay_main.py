@@ -6,14 +6,23 @@ TACHIKOMA 統合モーション自動再生スクリプト (src/replay_main.py)
 指定された複数の CSV モーションファイルを、それぞれの指定回数ずつ順番に連続再生します。
 --arm（実機） / --sim（3D画面）オプションにより、画面・実機・両方を自由に選択可能です。
 
+【安全機能】
+1. 起動直後の安全初期化（急発進防止）
+   トルクOFFの状態で実機の静止角度を読み取ってからトルクをONにし、
+   初速0のコサインS字加減速でゆっくりHome位置へ遷移します。
+2. コサイン補間（S字カーブ加減速）
+   動作中・終了時・Rキー復帰時のすべての遷移で加速度を連続にし、急激な負荷を防ぎます。
+3. Rキー巻き戻し時の安全復帰シーケンス
+   現在姿勢 ➔ Home位置 ➔ 開始姿勢 を滑らかに経由してリスタートします。
+
 【実行コマンド例】
-  1. 単一ファイルを1回再生（ファイル名のみ）
+  - 画面シミュレーションのみで再生
       python src/replay_main.py motions/A.csv --sim
-
-  2. 単一ファイルを3回再生（コロンで回数指定 "ファイル:回数"）
-      python src/replay_main.py motions/A.csv:3 --arm --sim
-
-  3. 複数ファイルを連続シーケンス実行 (Aを1回 ➔ Bを3回 ➔ Cを2回)
+  - 実機フォロワーのみで再生
+      python src/replay_main.py motions/A.csv --arm
+  - 実機フォロワー ＋ 3D画面表示で同時に再生
+      python src/replay_main.py motions/A.csv --arm --sim
+  - 複数ファイルを指定回数ずつ連続再生 (Aを1回 ➔ Bを3回 ➔ Cを2回)
       python src/replay_main.py motions/A.csv:1 motions/B.csv:3 motions/C.csv:2 --arm --sim
 ==============================================================================
 """
@@ -22,6 +31,7 @@ import sys
 import time
 import csv
 import os
+import math
 import argparse
 
 # ==============================================================================
@@ -44,8 +54,10 @@ from core.sim_viewer import MujocoSimViewer
 # ==============================================================================
 # 2. 安全動作パラメータ設定
 # ==============================================================================
-HOME_RETURN_DURATION = 2.5         # 規定の Home 位置への復帰にかける秒数[cite: 5]
-MOTION_START_TRANSITION = 2.0      # モーション開始姿勢への位置合わせにかける秒数[cite: 5]
+STARTUP_HOME_DURATION = 3.0       # 起動直後、現在位置からHomeへ安全復帰する秒数（やや長めで安心）
+HOME_RETURN_DURATION = 2.5        # 通常のHome復帰にかける秒数
+MOTION_START_TRANSITION = 2.0     # モーション開始姿勢への位置合わせにかける秒数
+RESET_REWIND_DURATION = 2.0       # Rキー巻き戻し時に Home へ戻す秒数
 
 
 # ==============================================================================
@@ -57,7 +69,6 @@ def parse_arguments():
         description="TACHIKOMA 複数モーション連続再生 統合スクリプト"
     )
 
-    # 再生対象の CSV ファイル（複数指定可能、"ファイルパス:回数" の形式に対応）
     parser.add_argument(
         "files",
         nargs="+",
@@ -65,14 +76,12 @@ def parse_arguments():
         help="再生するモーションファイル（例: motions/A.csv motions/B.csv:3 motions/C.csv:2）"
     )
 
-    # --arm オプション (実機フォロワーへの送信有効化)
     parser.add_argument(
         "--arm",
         action="store_true",
         help="実機フォロワーでの自動再生を有効化します（デフォルト: OFF）"
     )
 
-    # --sim オプション (MuJoCo 3D画面の表示有効化)
     parser.add_argument(
         "--sim",
         action="store_true",
@@ -86,10 +95,7 @@ def parse_arguments():
 # 4. 補助関数
 # ==============================================================================
 def parse_sequence_items(raw_items):
-    """
-    コマンドラインの文字列リストから「ファイルパス」と「再生回数」のリストを作成する
-    例: ["motions/A.csv", "motions/B.csv:3"] -> [("motions/A.csv", 1), ("motions/B.csv", 3)]
-    """
+    """コマンドラインの文字列リストからファイルパスと再生回数のリストを作成"""
     sequence = []
     for item in raw_items:
         if ":" in item:
@@ -122,18 +128,36 @@ def load_motion_data(filepath):
     return frames
 
 
-def smooth_move(follower_driver, sim_viewer, start_positions, target_positions, duration=2.0, steps=60):
+def smooth_move(follower_driver, sim_viewer, target_positions, fallback_state=None, duration=2.5, steps=75):
     """
-    開始姿勢から目標姿勢へ指定秒数かけて補間移動する
-    （実機フォロワーおよび 3D シミュレータ画面の両方を同期更新）
+    実機サーボの生角度を取得し、コサイン補間（S字カーブ）で目標姿勢へ移動。
+    初速と終速がゼロになるため急発進・急停止が起きません。
     """
-    interval = duration / steps
-    for step in range(1, steps + 1):
-        ratio = step / steps
-        current_step_positions = {}
+    start_positions = {}
+    for sid in SERVO_IDS:
+        if follower_driver is not None:
+            p = follower_driver.read_position(sid)
+            if p is not None:
+                start_positions[sid] = p
+            elif fallback_state is not None and sid in fallback_state:
+                start_positions[sid] = fallback_state[sid]
+            else:
+                start_positions[sid] = JOINT_CONFIG[sid]["init"]
+        else:
+            if fallback_state is not None and sid in fallback_state:
+                start_positions[sid] = fallback_state[sid]
+            else:
+                start_positions[sid] = JOINT_CONFIG[sid]["init"]
 
+    interval = duration / steps
+
+    for step in range(1, steps + 1):
+        t = step / steps
+        ratio = (1.0 - math.cos(t * math.pi)) / 2.0
+
+        current_step_positions = {}
         for sid in SERVO_IDS:
-            start_p = start_positions.get(sid, JOINT_CONFIG[sid]["init"])
+            start_p = start_positions[sid]
             target_p = target_positions.get(sid, JOINT_CONFIG[sid]["init"])
             current_p = int(start_p + ratio * (target_p - start_p))
             current_step_positions[sid] = current_p
@@ -157,19 +181,16 @@ def main():
     enable_sim = args.sim
     raw_file_items = args.files
 
-    # どちらも指定されていない場合は、安全のため画面シミュレーションをデフォルト起動
     if not enable_follower and not enable_sim:
         print("💡 --arm も --sim も指定されていないため、デフォルトで [--sim] (3D画面表示) を有効化します。")
         enable_sim = True
 
-    # 動作モード文字列の作成
     mode_list = []
     if enable_follower:
         mode_list.append("🤖 実機フォロワー再生")
     if enable_sim:
         mode_list.append("🖥️ 3D画面描画")
 
-    # ファイルパスと再生回数の解析・事前ロード
     sequence_items = parse_sequence_items(raw_file_items)
     loaded_motions = []
 
@@ -200,9 +221,7 @@ def main():
     if enable_follower:
         try:
             follower = STS3215Driver(FOLLOWER_PORT, baudrate=BAUDRATE, timeout=0.01)
-            for sid in SERVO_IDS:
-                follower.set_torque(sid, True)
-            print(f"✅ 実機フォロワー接続完了 ({FOLLOWER_PORT})")
+            print(f"✅ 実機フォロワーポート接続完了 ({FOLLOWER_PORT})")
         except Exception as e:
             print(f"❌ 実機フォロワー接続失敗: {e}")
             return
@@ -220,20 +239,33 @@ def main():
 
     try:
         home_positions = {sid: JOINT_CONFIG[sid]["init"] for sid in SERVO_IDS}
-
-        # 起動直後の姿勢を取得
         current_state = {}
+
+        # ----------------------------------------------------------------------
+        # 🛡️ 起動時安全シーケンス：
+        # トルクをかける前に現在の物理角度を読み取り、急発進を確実に防ぐ
+        # ----------------------------------------------------------------------
         if follower is not None:
-            print("\n🔍 フォロワーの現在姿勢を確認中...")
+            print("\n🔍 起動時の実機静止姿勢をスキャン中（トルクOFF安全状態）...")
             for sid in SERVO_IDS:
                 pos = follower.read_position(sid)
                 current_state[sid] = pos if pos is not None else home_positions[sid]
+            
+            # 現在の姿勢を目標値として保持した状態でトルクをON
+            for sid in SERVO_IDS:
+                follower.write_position(sid, current_state[sid])
+                follower.set_torque(sid, True)
+            print("✅ トルクをONにしました（姿勢維持中）。")
         else:
             current_state = dict(home_positions)
 
-        # 最初の周回前に、現在位置 ➔ Home への復帰
-        print(f"🏠 規定の初期位置（Home）へ復帰中 ({HOME_RETURN_DURATION}秒)...")
-        smooth_move(follower, sim, current_state, home_positions, duration=HOME_RETURN_DURATION)
+        # 3Dモデル側も実機の初期姿勢に合わせる
+        if sim is not None:
+            sim.update_joints(current_state)
+
+        # 起動直後の姿勢 ➔ Home へのコサインS字復帰
+        print(f"🏠 初期位置（Home）へ滑らかに復帰中 ({STARTUP_HOME_DURATION}秒)...")
+        smooth_move(follower, sim, home_positions, fallback_state=current_state, duration=STARTUP_HOME_DURATION)
         current_state = dict(home_positions)
         time.sleep(0.3)
 
@@ -248,7 +280,7 @@ def main():
                 frames = motion_item["frames"]
                 total_duration = frames[-1][0]
 
-                # このモーションの開始姿勢（第1フレーム）を算出
+                # 開始目標姿勢（第1フレーム）の事前計算
                 first_raw_positions = frames[0][1]
                 first_targets = {}
                 temp_prev = {}
@@ -264,16 +296,16 @@ def main():
                 for loop_idx in range(repeat_count):
                     print(f"\n--- 🔄 {filename} [{loop_idx + 1} / {repeat_count} 周目] ---")
 
-                    # 直前の位置が Home でない場合は Home に戻す
+                    # Home への安全復帰（必要な場合）
                     if current_state != home_positions:
                         print(f"🏠 規定の初期位置へ復帰中 ({HOME_RETURN_DURATION}秒)...")
-                        smooth_move(follower, sim, current_state, home_positions, duration=HOME_RETURN_DURATION)
+                        smooth_move(follower, sim, home_positions, fallback_state=current_state, duration=HOME_RETURN_DURATION)
                         current_state = dict(home_positions)
                         time.sleep(0.3)
 
-                    # Home ➔ モーション開始姿勢へアプローチ
+                    # Home ➔ モーション開始姿勢へS字アプローチ
                     print(f"🎯 開始姿勢へアプローチ中 ({MOTION_START_TRANSITION}秒)...")
-                    smooth_move(follower, sim, current_state, first_targets, duration=MOTION_START_TRANSITION)
+                    smooth_move(follower, sim, first_targets, fallback_state=current_state, duration=MOTION_START_TRANSITION)
                     current_state = dict(first_targets)
                     time.sleep(0.4)
 
@@ -287,28 +319,40 @@ def main():
                         if sim is not None and not sim.is_running():
                             return
 
-                        # 3D画面での一時停止
                         if sim is not None and sim.paused:
                             time.sleep(0.02)
                             playback_start_time = time.time() - frames[frame_idx][0]
                             continue
 
-                        # 3D画面での最初からリプレイ
+                        # Rキー検知時の安全巻き戻しシーケンス
                         if sim is not None and sim.reset_requested:
                             sim.reset_requested = False
+                            print("\n🔄 [Rキー検知] 安全に巻き戻しています...")
+
+                            print(f"🏠 Home 位置へ安全復帰中 ({RESET_REWIND_DURATION}秒)...")
+                            smooth_move(follower, sim, home_positions, fallback_state=current_state, duration=RESET_REWIND_DURATION)
+                            current_state = dict(home_positions)
+                            time.sleep(0.2)
+
+                            print(f"🎯 開始姿勢へ位置合わせ中 ({MOTION_START_TRANSITION}秒)...")
+                            smooth_move(follower, sim, first_targets, fallback_state=current_state, duration=MOTION_START_TRANSITION)
+                            current_state = dict(first_targets)
+                            time.sleep(0.3)
+
+                            prev_leader_cache = {}
+                            follower_current_cache = dict(home_positions)
                             frame_idx = 0
                             playback_start_time = time.time()
+                            print("▶️ モーションを最初から再開します。\n")
                             continue
 
                         t_target, raw_positions = frames[frame_idx]
 
-                        # CSV のタイムスタンプに合わせて実時間同期
                         elapsed = time.time() - playback_start_time
                         if elapsed < t_target:
                             time.sleep(0.001)
                             continue
 
-                        # 全関節の目標値を計算
                         target_positions = {}
                         for sid in SERVO_IDS:
                             raw_val = raw_positions[sid]
@@ -331,15 +375,14 @@ def main():
 
                     print("")
 
-                    # 周回終了後、Home へ安全に戻す
+                    # 周回終了後のHome安全復帰
                     print(f"🏠 モーション終了 ➔ Homeへ復帰中 ({HOME_RETURN_DURATION}秒)...")
-                    smooth_move(follower, sim, current_state, home_positions, duration=HOME_RETURN_DURATION)
+                    smooth_move(follower, sim, home_positions, fallback_state=current_state, duration=HOME_RETURN_DURATION)
                     current_state = dict(home_positions)
                     time.sleep(0.3)
 
             print("\n✅ 全てのモーションシーケンス再生が完了しました。")
 
-            # 3Dビューア単体再生時、終了後もウィンドウを開いたまま待機
             if sim is not None and follower is None:
                 print("💡 [R]キーでシーケンス全体を最初からリプレイ可能です。（ウィンドウを閉じると終了）")
                 while sim.is_running():
@@ -349,7 +392,6 @@ def main():
                         break
                     time.sleep(0.05)
 
-        # 3D画面が有効なら launch コンテキスト内で実行
         if sim is not None:
             with sim.launch():
                 run_playback()
