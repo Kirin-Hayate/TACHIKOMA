@@ -101,7 +101,7 @@ def execute_sequence(sequence_plan, follower_driver=None, sim_viewer=None):
 
         frames = load_motion_frames(filepath)
         if not frames:
-            print(f"⚠️ ファイルの読み込みに失敗しました: {filename}")
+            print(f"ファイルの読み込みに失敗しました: {filename}")
             continue
 
         first_raw = frames[0][1]
@@ -161,14 +161,14 @@ def main():
     if args.arm:
         try:
             follower = STS3215Driver(FOLLOWER_PORT, baudrate=BAUDRATE, timeout=0.01)
-            print(f"✅ 実機フォロワー接続完了 ({FOLLOWER_PORT})")
+            print(f" 実機フォロワー接続完了 ({FOLLOWER_PORT})")
         except Exception as e:
-            print(f"⚠️ 実機接続失敗: {e}")
+            print(f"実機接続失敗: {e}")
             follower = None
 
     print("==================================================")
-    print(" 🤖 TACHIKOMA 自然言語対話エージェント")
-    print(f" ⚙️ 実機実行モード: {'有効 (--arm)' if follower else 'シミュレーションプレビューのみ'}")
+    print(" TACHIKOMA 自然言語対話エージェント")
+    print(f" 実機実行モード: {'有効 (--arm)' if follower else 'シミュレーションプレビューのみ'}")
     print("==================================================")
 
     try:
@@ -179,35 +179,35 @@ def main():
             if not user_msg:
                 continue
 
-            print("🧠 プラン生成中...")
+            print("プラン生成中...")
             plan = planner.plan(user_msg)
 
-            print(f"\n💬 タチコマ: {plan.get('reply_text')}")
-            print(f"💡 思考理由: {plan.get('thought')}")
+            print(f"\nタチコマ: {plan.get('reply_text')}")
+            print(f"思考理由: {plan.get('thought')}")
             
             sequence = plan.get("sequence", [])
             if not sequence:
-                print("⚠️ 有効なシーケンスが生成されませんでした。")
+                print("有効なシーケンスが生成されませんでした。")
                 continue
 
-            print("\n📋 【実行予定シーケンス】")
+            print("\n【実行予定シーケンス】")
             for idx, item in enumerate(sequence, start=1):
                 print(f"   {idx}. {item['file']} (x{item['repeat']}回)")
 
             # --- 1. 3D画面でのプレビュー再生 ---
-            print("\n🖥️ 3Dシミュレータでプレビューを再生します...")
+            print("\n3Dシミュレータでプレビューを再生します...")
             try:
                 sim = MujocoSimViewer()
                 with sim.launch():
                     execute_sequence(sequence, follower_driver=None, sim_viewer=sim)
             except Exception as e:
-                print(f"⚠️ シミュレータプレビューエラー: {e}")
+                print(f"シミュレータプレビューエラー: {e}")
 
             # --- 2. 実機実行の確認 ---
             if follower is not None:
-                confirm = input("\n❓ この動作を実機で実行しますか？ [y/N] > ").strip().lower()
+                confirm = input("\nこの動作を実機で実行しますか？ [y/N] > ").strip().lower()
                 if confirm == 'y':
-                    print("🤖 実機でシーケンスを実行します...")
+                    print("実機でシーケンスを実行します...")
                     # トルクON
                     for sid in SERVO_IDS:
                         follower.set_torque(sid, True)
@@ -217,9 +217,9 @@ def main():
                     # 終了後は安全のため脱力
                     for sid in SERVO_IDS:
                         follower.set_torque(sid, False)
-                    print("✅ 実機動作が完了しました。")
+                    print("実機動作が完了しました。")
                 else:
-                    print("🛑 実機実行をキャンセルしました。")
+                    print("実機実行をキャンセルしました。")
 
     except KeyboardInterrupt:
         print("\n\n終了します。")
@@ -228,7 +228,7 @@ def main():
             for sid in SERVO_IDS:
                 follower.set_torque(sid, False)
             follower.close()
-            print("✅ フォロワーポートをクローズしました。")
+            print("フォロワーポートをクローズしました。")
 
 
 if __name__ == "__main__":
