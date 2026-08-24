@@ -29,7 +29,7 @@ from core.sim_viewer import MujocoSimViewer
 # ==============================================================================
 # 2. 再生対象ファイル設定
 # ==============================================================================
-CSV_FILENAME = "motion_20260822_221201.csv"  # 再生したいモーションファイル名
+CSV_FILENAME = "動作確認min_to_max.csv"  # 再生したいモーションファイル名
 CSV_PATH = os.path.join(BASE_DIR, "motions", CSV_FILENAME)
 
 

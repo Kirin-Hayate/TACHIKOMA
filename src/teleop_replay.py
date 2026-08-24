@@ -36,7 +36,7 @@ from core.kinematics import calculate_target
 # ==============================================================================
 # 実行したい CSV ファイル名と再生回数のリスト [ [ファイル名, 再生回数], ... ]
 MOTION_SEQUENCE = [
-    ["motion_20260822_221201.csv", 1]
+    ["動作確認min_to_max.csv", 1]
 ]
 
 MOTIONS_DIR = os.path.join(BASE_DIR, "motions")

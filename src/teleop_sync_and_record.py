@@ -38,7 +38,7 @@ from core.kinematics import calculate_target
 # ==============================================================================
 # 2. 動作モード & 保存先ファイル設定
 # ==============================================================================
-RECORD_MODE = False       # True: 同期 + CSV記録 / False: 同期専用 (記録OFF)
+RECORD_MODE = True       # True: 同期 + CSV記録 / False: 同期専用 (記録OFF)
 TEST_IDS = [1, 2, 3, 4, 5, 6]  # 同期させる関節ID（テスト時はここを絞り込めます）
 
 # モーション保存用フォルダの作成
@@ -46,7 +46,9 @@ MOTIONS_DIR = os.path.join(BASE_DIR, "motions")
 os.makedirs(MOTIONS_DIR, exist_ok=True)
 
 # 日時付きファイル名の生成
+#一時的に任意のファイル名に変更する場合のみ以下の一文をコメントアウト
 DEFAULT_FILENAME = f"motion_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+#DEFAULT_FILENAME = f"動作確認min_to_max.csv"
 OUTPUT_FILEPATH = os.path.join(MOTIONS_DIR, DEFAULT_FILENAME)
 
 
