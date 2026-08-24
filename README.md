@@ -45,6 +45,8 @@ SO-ARM100 をベースに、攻殻機動隊に登場する「タチコマ」の�
 
 ```text
 TACHIKOMA/
+├── assets/                  #アームの3Dモデル等を保管
+├── archive/                 #過去のコード,motionsのcsvファイルなどを保管
 ├── config/
 │   └── joint_config.py      # ポート設定、ボーレート、各軸可動範囲・初期位置定義
 ├── core/
@@ -58,6 +60,6 @@ TACHIKOMA/
 ├── src/
 │   ├── teleop_main.py       # リアルタイム遠隔操作・記録統合スクリプト
 │   ├── replay_main.py       # モーション自動再生スクリプト
-│   └── tachikoma_agent_1.py   # 自然言語対話・プレビュー・実機承認実行エージェント
+│   └── tachikoma_agent_1.py # 自然言語対話・プレビュー・実機承認実行エージェント
 ├── requirements.txt         # 依存ライブラリ一覧
 └── README.md
