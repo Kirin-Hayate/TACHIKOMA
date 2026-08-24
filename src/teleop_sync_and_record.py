@@ -1,26 +1,47 @@
+"""
+==============================================================================
+リアルタイム遠隔操作 & モーション記録スクリプト (src/teleop_sync_and_record.py)
+==============================================================================
+【役割】
+1. 操作側（リーダー）の動きを読み取り、追従側（フォロワー）へリアルタイム送信します。
+2. RECORD_MODE = True の場合、動作データを CSV ファイルとして motions/ フォルダへ記録します。
+3. 通信ドライバや角度計算などの低レイヤ処理はすべて core/ および config/ から呼び出します。
+==============================================================================
+"""
+
 import sys
 import time
-import serial
 import csv
 import os
 from datetime import datetime
 
-# ==========================================
-# 1. 通信設定・ファイル保存先設定
-# ==========================================
-RECORD_MODE = False       # 👈 True: 同期＋記録 / False: 同期のみ
-LEADER_PORT = 'COM3'      # 操作側（リーダー）のシリアルポート
-FOLLOWER_PORT = 'COM4'    # 追従側（フォロワー）のシリアルポート
-BAUDRATE = 1000000        # 通信速度（1Mbps）
-SAMPLING_RATE_HZ = 50     # 記録・同期周期（50Hz = 0.02秒間隔）
-
-# 🧪 【試験用フィルタ】同期させたい関節IDを指定
-TEST_IDS = [1, 2, 3, 4, 5, 6]
-SERVO_IDS = [1, 2, 3, 4, 5, 6]
-DIRECTION = {1: 1, 2: 1, 3: 1, 4: 1, 5: 1, 6: 1}
-
-# スクリプトの場所を基準にして motions/ フォルダへ保存
+# ==============================================================================
+# 1. 共通モジュール・設定のインポート
+# ==============================================================================
+# プロジェクトルートディレクトリのパスを通す
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if BASE_DIR not in sys.path:
+    sys.path.append(BASE_DIR)
+
+# 設定・通信・計算クラスの読み込み
+from config.joint_config import (
+    LEADER_PORT,
+    FOLLOWER_PORT,
+    BAUDRATE,
+    SAMPLING_RATE_HZ,
+    SERVO_IDS,
+    JOINT_CONFIG
+)
+from core.sts3215 import STS3215Driver
+from core.kinematics import calculate_target
+
+# ==============================================================================
+# 2. 動作モード & 保存先ファイル設定
+# ==============================================================================
+RECORD_MODE = False       # True: 同期 + CSV記録 / False: 同期専用 (記録OFF)
+TEST_IDS = [1, 2, 3, 4, 5, 6]  # 同期させる関節ID（テスト時はここを絞り込めます）
+
+# モーション保存用フォルダの作成
 MOTIONS_DIR = os.path.join(BASE_DIR, "motions")
 os.makedirs(MOTIONS_DIR, exist_ok=True)
 
@@ -28,140 +49,10 @@ os.makedirs(MOTIONS_DIR, exist_ok=True)
 DEFAULT_FILENAME = f"motion_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
 OUTPUT_FILEPATH = os.path.join(MOTIONS_DIR, DEFAULT_FILENAME)
 
-# ==========================================
-# 2. リーダー・フォロワー可動範囲プロファイル
-# ==========================================
-JOINT_CONFIG = {
-    1: {
-        "type": "bounded", 
-        "r_min": 2850, "r_max": 4096 + 1400, "r_cross": True,
-        "f_min": 850,  "f_max": 3400,        "f_cross": False,
-        "init": 2500
-    },
-    2: {
-        "type": "bounded", 
-        "r_min": 1715, "r_max": 4096 + 100,   "r_cross": True,
-        "f_min": 942,  "f_max": 3270,        "f_cross": False,
-        "init": 973
-    },
-    3: {
-        "type": "bounded", 
-        "r_min": 900,  "r_max": 3100,        "r_cross": False,
-        "f_min": 834,  "f_max": 3061,        "f_cross": False,
-        "init": 3061
-    },
-    4: {
-        "type": "bounded", 
-        "r_min": 1650, "r_max": 4015,        "r_cross": False,
-        "f_min": 735,  "f_max": 3214,        "f_cross": False,
-        "init": 735
-    },
-    5: {
-        "type": "infinite", 
-        "init": 1023
-    },
-    6: {
-        "type": "bounded", 
-        "r_min": 1990, "r_max": 3000,        "r_cross": False,
-        "f_min": 1890, "f_max": 3152,        "f_cross": False,
-        "init": 1837
-    },
-}
 
-# ==========================================
-# 3. 通信ヘルパー関数
-# ==========================================
-def read_servo_position(ser, servo_id):
-    """リーダーサーボから現在位置の生データ（0〜4095）を読み取る"""
-    addr = 0x38
-    read_len = 2
-    length = 4
-    checksum = ~(servo_id + length + 0x02 + addr + read_len) & 0xFF
-    packet = bytes([0xFF, 0xFF, servo_id, length, 0x02, addr, read_len, checksum])
-    
-    ser.write(packet)
-    time.sleep(0.001)
-    response = ser.read(8)
-    
-    if len(response) >= 7 and response[2] == servo_id:
-        pos = response[5] | (response[6] << 8)
-        if 0 <= pos <= 4095:
-            return pos
-    return None
-
-
-def write_follower_position(ser, servo_id, pos):
-    """フォロワー側へ目標位置を書き込む"""
-    pos = int(max(0, min(4095, pos)))
-    addr = 0x2A
-    length = 5
-    pos_l = pos & 0xFF
-    pos_h = (pos >> 8) & 0xFF
-    checksum = ~(servo_id + length + 0x03 + addr + pos_l + pos_h) & 0xFF
-    packet = bytes([0xFF, 0xFF, servo_id, length, 0x03, addr, pos_l, pos_h, checksum])
-    ser.write(packet)
-    time.sleep(0.001)
-
-
-def set_torque(ser, servo_id, enable):
-    """フォロワーサーボのトルクON/OFF"""
-    addr = 0x28
-    length = 4
-    en_val = 1 if enable else 0
-    checksum = ~(servo_id + length + 0x03 + addr + en_val) & 0xFF
-    packet = bytes([0xFF, 0xFF, servo_id, length, 0x03, addr, en_val, checksum])
-    ser.write(packet)
-    time.sleep(0.002)
-
-
-# ==========================================
-# 4. 1:1 等倍マッピング変換ロジック
-# ==========================================
-def calculate_target(sid, raw_leader, prev_raw_cache, follower_current_cache):
-    config = JOINT_CONFIG[sid]
-    direction = DIRECTION[sid]
-    
-    if config["type"] == "bounded":
-        r_min = config["r_min"]
-        r_max = config["r_max"]
-        r_cross = config["r_cross"]
-        f_min = config["f_min"]
-        f_max = config["f_max"]
-        f_cross = config["f_cross"]
-        
-        raw_l = raw_leader
-        if r_cross and raw_l < (r_max - 4096):
-            raw_l += 4096
-            
-        ratio = 0.0 if r_max == r_min else (raw_l - r_min) / (r_max - r_min)
-        ratio = max(0.0, min(1.0, ratio))
-        
-        f_max_linear = f_max
-        if f_cross and f_max < f_min:
-            f_max_linear += 4096
-            
-        target_linear = f_min + ratio * (f_max_linear - f_min)
-        if direction == -1:
-            target_linear = f_min + (f_max_linear - target_linear)
-            
-        return int(max(200, min(3900, target_linear)))
-
-    elif config["type"] == "infinite":
-        prev_raw = prev_raw_cache.get(sid, raw_leader)
-        diff = raw_leader - prev_raw
-        if diff > 2048:
-            diff -= 4096
-        elif diff < -2048:
-            diff += 4096
-            
-        current_target = follower_current_cache.get(sid, config["init"])
-        new_target = current_target + (diff * direction)
-        return new_target  # ⭕ teleop_sync.py と同様に剰余を外して連続値を返す
-
-
-# ==========================================
-# 5. 同期＆記録メイン処理
-# ==========================================
+# ==============================================================================
+# 3. メイン同期・記録ループ
+# ==============================================================================
 def main():
     mode_title = "同期 ＆ モーション記録モード" if RECORD_MODE else "同期専用モード (記録OFF)"
     print("========================================")
@@ -173,23 +64,24 @@ def main():
 
     f = None
     writer = None
+    leader = None
+    follower = None
 
     try:
-        ser_leader = serial.Serial(LEADER_PORT, BAUDRATE, timeout=0.01)
-        ser_follower = serial.Serial(FOLLOWER_PORT, BAUDRATE, timeout=0.01)
+        # --- 通信ドライバの初期化 ---
+        leader = STS3215Driver(LEADER_PORT, baudrate=BAUDRATE, timeout=0.01)
+        follower = STS3215Driver(FOLLOWER_PORT, baudrate=BAUDRATE, timeout=0.01)
 
-        ser_leader.reset_input_buffer()
-        ser_follower.reset_input_buffer()
-
-        # 指定IDのフォロワートルクをON
+        # 指定IDのフォロワートルクをON（動かさない軸はフリー）
         for sid in SERVO_IDS:
-            set_torque(ser_follower, sid, sid in TEST_IDS)
+            follower.set_torque(sid, sid in TEST_IDS)
 
+        # 差分追従（ID5）および通信エラー対策用のキャッシュ
         prev_leader_cache = {}
         follower_current_cache = {sid: JOINT_CONFIG[sid].get("init", 2048) for sid in SERVO_IDS}
         last_valid_positions = {sid: 2048 for sid in SERVO_IDS}
 
-        # 記録モード時のみCSVファイルをオープン
+        # 記録モード時のみ CSV ファイルを新規作成してヘッダーを書き込む
         if RECORD_MODE:
             f = open(OUTPUT_FILEPATH, mode='w', newline='', encoding='utf-8')
             writer = csv.writer(f)
@@ -197,11 +89,11 @@ def main():
             writer.writerow(header)
 
         start_time = time.time()
-        interval = 1.0 / SAMPLING_RATE_HZ
+        interval = 1.0 / SAMPLING_RATE_HZ  # 50Hz = 0.02秒
         frame_count = 0
         first_draw = True
 
-        # 画面のちらつき防止のためカーソルを非表示
+        # 画面のちらつき防止のためターミナルのカーソルを非表示
         sys.stdout.write("\033[?25l")
         sys.stdout.flush()
 
@@ -211,7 +103,8 @@ def main():
 
             current_csv_row = [f"{current_timestamp:.4f}"] if RECORD_MODE else []
             mode_label = "記録中" if RECORD_MODE else "同期中"
-            
+
+            # ターミナル表示用バッファの構築
             lines = []
             lines.append("========================================")
             lines.append(f" ⏱️ 状態: {mode_label}  {current_timestamp:5.2f}s [{frame_count:5d} frames]")
@@ -219,9 +112,11 @@ def main():
                 lines.append(f" 📁 {os.path.basename(OUTPUT_FILEPATH)}")
             lines.append("========================================")
 
+            # --- 全軸の読み出し・計算・追従処理 ---
             for sid in SERVO_IDS:
-                raw_pos = read_servo_position(ser_leader, sid)
-                
+                # リーダーの生値を読み取り
+                raw_pos = leader.read_position(sid)
+
                 if raw_pos is not None:
                     last_valid_positions[sid] = raw_pos
 
@@ -229,13 +124,16 @@ def main():
                 if RECORD_MODE:
                     current_csv_row.append(current_raw)
 
-                # フォロワー同期制御
+                # フォロワーへの目標値計算と送信
                 if sid in TEST_IDS and raw_pos is not None:
+                    # core/kinematics.py の関数で目標値を算出
                     target_pos = calculate_target(sid, current_raw, prev_leader_cache, follower_current_cache)
-                    write_follower_position(ser_follower, sid, target_pos)
+                    follower.write_position(sid, target_pos)
 
+                    # キャッシュ更新
                     prev_leader_cache[sid] = current_raw
                     follower_current_cache[sid] = target_pos
+
                     lines.append(f" [ID {sid}]  Raw: {current_raw:4d}  |  Target: {target_pos:4d}  |  (Sync)")
                 else:
                     lines.append(f" [ID {sid}]  Raw: {current_raw:4d}  |  (OFF)")
@@ -243,22 +141,21 @@ def main():
             lines.append("========================================")
             lines.append(" [Ctrl+C] で停止して終了")
 
-            # 2回目以降のループでは、前回出力した行数分だけカーソルを上に戻して上書き
+            # 2回目以降の描画では、前回描画した行数分カーソルを巻き戻して上書き固定表示
             if not first_draw:
                 sys.stdout.write(f"\033[{len(lines)}A")
             else:
                 first_draw = False
 
-            # 各行を行末クリアしながら出力
             sys.stdout.write("\n".join(line + "\033[K" for line in lines) + "\n")
             sys.stdout.flush()
 
-            # 記録モード時のみCSVへ書き込み
+            # CSVへ1フレーム書き込み
             if RECORD_MODE and writer:
                 writer.writerow(current_csv_row)
             frame_count += 1
 
-            # 50Hz周期を維持
+            # 50Hz (0.02秒) 周期を正確に維持
             elapsed = time.time() - loop_start
             sleep_time = interval - elapsed
             if sleep_time > 0:
@@ -272,15 +169,15 @@ def main():
         sys.stdout.write("\033[?25h")
         print(f"\n❌ エラー: {e}")
     finally:
-        sys.stdout.write("\033[?25h")  # カーソルを確実に再表示
+        sys.stdout.write("\033[?25h")  # カーソル再表示
         if f is not None and not f.closed:
             f.close()
-        if 'ser_follower' in locals() and ser_follower.is_open:
+        if follower is not None:
             for sid in SERVO_IDS:
-                set_torque(ser_follower, sid, False)
-            ser_follower.close()
-        if 'ser_leader' in locals() and ser_leader.is_open:
-            ser_leader.close()
+                follower.set_torque(sid, False)
+            follower.close()
+        if leader is not None:
+            leader.close()
         print("✅ フォロワーのトルクをOFFにし、全ポートをクローズしました。")
 
 
