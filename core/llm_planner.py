@@ -3,10 +3,8 @@
 LLM タスクプランナー (core/llm_planner.py)
 ==============================================================================
 【役割】
-1. .env から GEMINI_API_KEY を自動で読み込みます。
-2. motions/motions.json に登録された動作ファイル一覧を読み取ります。
-3. ユーザーの自然言語指示（例: 「AからBに運んで、そのあとCに持ってって！」）を
-   Gemini API (gemini-3.5-flash-Lite) に送り、実行すべきCSVファイルと回数のリスト (JSON) を生成します。
+ユーザーの自然言語指示を解釈し、搬送タスクの「掴む位置」と「置く位置」
+(地点名、方向、または角度) を抽出した JSON プランを生成します。
 ==============================================================================
 """
 
@@ -18,117 +16,124 @@ from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 
-# .env ファイルの環境変数を自動読み込み
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if BASE_DIR not in sys.path:
+    sys.path.append(BASE_DIR)
+
 env_path = os.path.join(BASE_DIR, ".env")
 load_dotenv(dotenv_path=env_path)
 
+from config.workspace_config import LOCATION_ANGLES, location_to_raw
+
 
 class LLMTaskPlanner:
-    def __init__(self, motions_json_path, api_key=None):
-        self.motions_json_path = motions_json_path
-        
-        # APIキーの取得確認
+    def __init__(self, api_key=None):
         self.api_key = api_key or os.getenv("GEMINI_API_KEY")
         if not self.api_key:
             raise ValueError(
                 "❌ GEMINI_API_KEY が見つかりません。\n"
-                "プロジェクト直下に .env ファイルを作成し、\n"
-                "GEMINI_API_KEY=AIzaSy... と記述してください。"
+                ".env ファイルを確認してください。"
             )
 
-        # Gemini クライアントの初期化
         self.client = genai.Client(api_key=self.api_key)
-        self.available_motions = self._load_motions()
-
-    def _load_motions(self):
-        if not os.path.exists(self.motions_json_path):
-            raise FileNotFoundError(f"❌ モーション定義ファイルが見つかりません: {self.motions_json_path}")
-        
-        with open(self.motions_json_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return data
+        self.known_locations = list(LOCATION_ANGLES.keys())
 
     def plan(self, user_instruction: str) -> dict:
+        """
+        自然言語指示から搬送パラメータを抽出
+        """
         system_instruction = (
-            "あなたは、ひとのくらしをサポートする手伝いロボット「タチコマ」のアクションプランナーです。\n"
-            "ユーザーからの自然言語指示を理解し、手持ちのモーション一覧から\n"
-            "最適な組み合わせと実行回数のシーケンスを作成してください。"
-            "【口調ルール】\n"
-            "・極めて冷静、論理的かつ簡潔に応答してください。\n"
-            "・一人称は『本システム』または『当機』。\n"
-            "・『了解。シーケンスを構成します』『ミッションパラメータを確認』などの軍事・システム用語を使用してください。"
+            "あなたは公安9課に配属されているオペレーター用女性型アンドロイド（プロッサー）です。\n"
+            "電脳通信および端末操作をミリ秒単位で処理する、極めて優秀な実務支援ユニットです。\n\n"
+            "【ペルソナ・口調ルール】\n"
+            "・一人称は『当機』または『オペレーター』。\n"
+            "・感情の起伏は一切見せず、極めて論理的、平坦、かつ簡潔な軍事・システム報告調（〜を確認、〜を実行します、スタンバイ完了）を用いてください。\n"
+            "・余計な雑談や装飾は省き、ステータスや座標、処理結果を明瞭に伝達してください。\n"
+            "・ユーザーからの自然言語指示を解釈し、マニピュレータが実行すべき\n"
+            "  「掴む位置 (pick)」と「置く位置 (place)」を特定してください。"
         )
 
         prompt = f"""
-【利用可能なモーション一覧 (motions.json)】
-{json.dumps(self.available_motions, ensure_ascii=False, indent=2)}
+【認識可能な既知の地点・方向の例】
+{json.dumps(self.known_locations, ensure_ascii=False)}
 
 【ユーザーの指示】
 "{user_instruction}"
 
 【出力形式要件】
-以下の JSON フォーマットのみを返してください:
+以下の JSON フォーマットのみを返してください。
+pick_location, place_location には、既知の地点名（例: "A", "右", "10時方向" など）や、
+文脈から読み取れる角度（数値や "30度" など）を入れてください。
+
 {{
-  "thought": "選択した理由",
-  "reply_text": "タチコマ口調の返答メッセージ",
-  "sequence": [
-    {{"file": "ファイル名.csv", "repeat": 1}}
-  ]
+  "thought": "座標・幾何パラメータの解析ログ",
+  "reply_text": "オペレーターとしてのシステム応答メッセージ",
+  "task": {{
+    "type": "pick_and_place",
+    "pick_location": "掴む位置の名称または角度",
+    "place_location": "置く位置の名称または角度"
+  }}
 }}
 """
 
         try:
-            # モデルはgemini-3.1-flash-lite
             response = self.client.models.generate_content(
                 model="gemini-3.1-flash-lite",
                 contents=prompt,
                 config=types.GenerateContentConfig(
                     system_instruction=system_instruction,
                     response_mime_type="application/json",
-                    temperature=0.2
+                    temperature=0.1
                 )
             )
 
-            # レスポンス文字列の確認
-            raw_text = response.text
-            plan_data = json.loads(raw_text)
+            plan_data = json.loads(response.text)
+            
+            task = plan_data.get("task", {})
+            pick_loc = task.get("pick_location", "中央")
+            place_loc = task.get("place_location", "中央")
+            
+            plan_data["raw_params"] = {
+                "theta_pick_raw": location_to_raw(pick_loc),
+                "theta_place_raw": location_to_raw(place_loc)
+            }
+
             return plan_data
 
         except Exception as e:
-            # 🔍 エラーの詳細をコンソールに出力
             print("\n🚨 [デバッグ情報] 例外が発生しました:")
             traceback.print_exc()
-            
             return {
-                "thought": "エラーが発生しました",
-                "reply_text": "プラン生成に失敗。もう一度指示を与えてください。",
-                "sequence": [],
+                "thought": "例外検知: パラメータの解析に失敗しました。",
+                "reply_text": "エラーを検知。座標パラメータの抽出に失敗しました。再入力を要求します。",
+                "task": {"type": "pick_and_place", "pick_location": "中央", "place_location": "中央"},
+                "raw_params": {"theta_pick_raw": 2048, "theta_place_raw": 2048},
                 "error": str(e)
             }
 
 
+# ==============================================================================
+# 単体テスト用メイン処理
+# ==============================================================================
 if __name__ == "__main__":
-    motions_path = os.path.join(BASE_DIR, "motions", "motions.json")
-
     print("==================================================")
-    print(" 🤖 LLM タスクプランナー 単体テスト")
+    print(" 🤖 パラメトリック LLM プランナー 単体テスト (オペレーターモード)")
     print("==================================================")
 
-    try:
-        planner = LLMTaskPlanner(motions_path)
-        test_prompt = "A地点の積み木をB地点に運んで！"
-        print(f"🗣️ 入力指示: {test_prompt}\n")
-        print("🧠 プラン生成中...")
+    planner = LLMTaskPlanner()
 
-        result = planner.plan(test_prompt)
+    test_prompts = [
+        "右側にある積み木を、正面の真ん中に移動させて！",
+        "10時方向のやつを2時方向へ運んでくれる？",
+        "A地点からC地点へ運んで！"
+    ]
 
-        print("\n--- 📝 生成されたプラン ---")
-        print(f"💬 返答: {result.get('reply_text')}")
-        print(f"💡 思考: {result.get('thought')}")
-        print("📋 実行シーケンス:")
-        for idx, item in enumerate(result.get("sequence", []), start=1):
-            print(f"   {idx}. {item.get('file')}  (再生回数: {item.get('repeat')}回)")
-
-    except Exception as e:
-        print(f"\n❌ エラー: {e}")
+    for prompt in test_prompts:
+        print(f"\n🗣️ 指示: {prompt}")
+        result = planner.plan(prompt)
+        print(f"💬 報告: {result.get('reply_text')}")
+        print(f"💡 ログ: {result.get('thought')}")
+        task = result.get("task") or {}
+        raws = result.get("raw_params") or {}
+        print(f"🎯 目標値: [{task.get('pick_location')}] ➔ [{task.get('place_location')}]")
+        print(f"   (ID1 Raw変換値: 掴み={raws.get('theta_pick_raw')} ➔ 配置={raws.get('theta_place_raw')})")
