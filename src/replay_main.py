@@ -320,6 +320,12 @@ def main():
                             return
 
                         if sim is not None and sim.paused:
+                            # 一時停止中のフレーム・時刻をリアルタイム表示
+                            t_target, _ = frames[frame_idx]
+                            sys.stdout.write(
+                                f" \r          {t_target:6.2f}s / {total_duration:6.2f}s [Frame{frame_idx + 1:4d} / {len(frames):4d}]  "
+                                )
+                            sys.stdout.flush()
                             time.sleep(0.02)
                             playback_start_time = time.time() - frames[frame_idx][0]
                             continue
