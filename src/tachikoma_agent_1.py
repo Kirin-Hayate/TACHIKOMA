@@ -90,16 +90,34 @@ def play_sequence(task_list, generator, follower_driver=None, sim_viewer=None):
         current_state = dict(first_target)
         time.sleep(0.2)
 
-        # 軌道再生
-        start_time = time.time()
+        # 軌道再生（速度倍率対応）
         total_duration = frames[-1][0]
+        sim_time = 0.0
+        last_wall_time = time.time()
+        frame_idx = 0
 
-        for frame_idx, (t_target, target_positions) in enumerate(frames):
+        while frame_idx < len(frames):
             if sim_viewer is not None and not sim_viewer.is_running():
                 return
 
-            while (time.time() - start_time) < t_target:
+            now = time.time()
+            dt = now - last_wall_time
+            last_wall_time = now
+
+            # 一時停止中の処理
+            if sim_viewer is not None and sim_viewer.paused:
+                time.sleep(0.02)
+                continue
+
+            # 速度倍率を取得して仮想時間を進める
+            speed = sim_viewer.playback_speed if sim_viewer is not None else 1.0
+            sim_time += dt * speed
+
+            t_target, target_positions = frames[frame_idx]
+
+            if sim_time < t_target:
                 time.sleep(0.001)
+                continue
 
             current_state = dict(target_positions)
             if follower_driver is not None:
@@ -109,8 +127,11 @@ def play_sequence(task_list, generator, follower_driver=None, sim_viewer=None):
             if sim_viewer is not None:
                 sim_viewer.update_joints(target_positions)
 
-            sys.stdout.write(f"\r⏱️ 再生中: {t_target:6.2f}s / {total_duration:6.2f}s [Frame {frame_idx + 1}/{len(frames)}]  ")
+            speed_str = f"({speed:.0f}x)" if speed > 1.0 else ""
+            sys.stdout.write(f"\r⏱️ 再生中{speed_str}: {t_target:6.2f}s / {total_duration:6.2f}s [Frame {frame_idx + 1}/{len(frames)}]  ")
             sys.stdout.flush()
+
+            frame_idx += 1
 
         print("")
         # 1ステップ終了後 Home 復帰
