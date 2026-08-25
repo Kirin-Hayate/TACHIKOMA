@@ -108,21 +108,17 @@ class ParametricMotionGenerator:
 # ==============================================================================
 if __name__ == "__main__":
     from core.sim_viewer import MujocoSimViewer
+    from config.joint_config import JOINT_CONFIG
     import time
-
-    print("==================================================")
-    print(" 🧪 パラメトリック・モーション生成 単体テスト")
-    print("==================================================")
 
     template_file = "motion_20260825_222909.csv"
     generator = ParametricMotionGenerator(template_file)
 
-    # テスト条件: 右前方(1500)で掴み、左前方(2600)へ置く
-    test_pick = 1500
-    test_place = 2600
-    print(f"🎯 目標角度: 掴み(ID1={test_pick}) ➔ 配置(ID1={test_place})")
+    # 🎯 正面（中央）で掴んで、別の指定角度へ置くテスト
+    pick_center = JOINT_CONFIG[1]["init"]  # 正面 (2048)
+    place_left  = 2600                    # 左前方
 
-    generated_frames = generator.generate(test_pick, test_place)
+    generated_frames = generator.generate(theta_pick_raw=pick_center, theta_place_raw=place_left)
     print(f"✅ モーション生成完了: 全 {len(generated_frames)} フレーム")
 
     print("\n🖥️ MuJoCo 3Dシミュレータでプレビュー再生を開始します...")
