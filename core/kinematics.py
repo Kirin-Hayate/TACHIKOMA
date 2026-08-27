@@ -5,25 +5,37 @@
 【役割】
 1. リーダーアームの生値 (Raw: 0〜4095) をフォロワーアームの目標値 (Target: 0〜4095) へ変換
 2. フォロワー目標値 (0〜4095) と MuJoCo ラジアン角 (-π〜+π) の双方向変換
-3. 解析的逆運動学 (IK): 極座標 (r, theta, z) から各関節目標 Raw 値の算出
+3. MuJoCo 内蔵ヤコビアン数値IK (位置＋真下向き姿勢拘束):
+   目標極座標 (r, theta, z) から各関節目標 Raw 値の算出
 ==============================================================================
 """
 
+import os
 import math
 from typing import Dict, Optional
+import numpy as np
+import mujoco
+
 from config.joint_config import JOINT_CONFIG, DIRECTION, SIM_OFFSETS, SIM_DIRECTIONS
-
-
-# ==============================================================================
-# SO-ARM100 幾何学リンク定数 (URDFより抽出: 単位はメートル)
-# ==============================================================================
-L0_BASE_HEIGHT = 0.1025       # 台座基準面から肩関節(Joint 2)までの垂直オフセット
-L1_UPPER_ARM   = 0.1160       # 肩(Joint 2)から肘(Joint 3)までのリンク長
-L2_LOWER_ARM   = 0.1350       # 肘(Joint 3)から手首(Joint 4)までのリンク長
-L3_HAND_TCP    = 0.1400       # 手首(Joint 4)からグリッパー把持中心(TCP)までの実効長
 
 # STS3215 サーボの分解能定数 (4096カウント / 360度)
 COUNTS_PER_RAD = 4096.0 / (2.0 * math.pi)
+
+# ==============================================================================
+# MuJoCo IK 専用内部モデルの読み込み
+# ==============================================================================
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+XML_PATH = os.path.join(BASE_DIR, "assets", "so100_scene.xml")
+
+_IK_MODEL = None
+_IK_DATA = None
+_JAW_BODY_ID = -1
+
+if os.path.exists(XML_PATH):
+    _IK_MODEL = mujoco.MjModel.from_xml_path(XML_PATH)
+    _IK_DATA = mujoco.MjData(_IK_MODEL)
+    # 最先端の爪パーツ (jaw) のボディIDを取得
+    _JAW_BODY_ID = mujoco.mj_name2id(_IK_MODEL, mujoco.mjtObj.mjOBJ_BODY, "jaw")
 
 
 def calculate_target(sid: int, raw_leader: int, prev_raw_cache: dict, follower_current_cache: dict) -> int:
@@ -88,74 +100,80 @@ def radian_to_raw(sid: int, angle_rad: float) -> int:
     return max(0, min(4095, raw_val))
 
 
+# 爪パーツ (jaw) のローカル座標系における先端 (TCP) オフセット [m]
+JAW_LOCAL_TCP_OFFSET = np.array([0.0, -0.045, 0.0])
+
+
 def solve_ik_polar(
     r: float, 
     theta_deg: float, 
     z: float, 
-    pitch_deg: float = -60.0
+    max_steps: int = 40, 
+    tol_pos: float = 2e-3, 
+    damping: float = 0.015
 ) -> Optional[Dict[int, int]]:
     """
-    極座標 (r, theta, z) から SO-ARM100 の各サーボ目標 Raw 値を解析的に逆算する
+    極座標 (r, theta, z) から SO-ARM100 の「爪先端」を目標位置へ誘導する (ヤコビアンDLS法)[cite: 2]
     """
-    # 旋回軸: 右が正 (+), 左が負 (-)[cite: 9]
-    theta_rad = math.radians(-theta_deg)
-    pitch_rad = math.radians(pitch_deg)
-
-    # 1. 手首ピッチ軸 (Joint 4) の目標位置を逆算[cite: 13]
-    # 肩関節(Joint 2)の幾何中心: 高さ 0.119m, 前方オフセット 0.0m[cite: 13]
-    Z_SHOULDER = 0.1190
-    r_w = r - L3_HAND_TCP * math.cos(pitch_rad)
-    z_w = z - Z_SHOULDER - L3_HAND_TCP * math.sin(pitch_rad)
-
-    d_sq = r_w**2 + z_w**2
-    d = math.sqrt(d_sq)
-
-    # 幾何到達判定[cite: 13]
-    max_reach = L1_UPPER_ARM + L2_LOWER_ARM
-    min_reach = abs(L1_UPPER_ARM - L2_LOWER_ARM)
-    if d > max_reach or d < min_reach:
+    if _IK_MODEL is None or _IK_DATA is None or _JAW_BODY_ID == -1:
         return None
 
-    # 2. 余弦定理 (Upper Arm と Lower Arm の成す三角形)[cite: 13]
-    cos_alpha = (L1_UPPER_ARM**2 + d_sq - L2_LOWER_ARM**2) / (2.0 * L1_UPPER_ARM * d)
-    cos_alpha = max(-1.0, min(1.0, cos_alpha))
-    alpha = math.acos(cos_alpha)
+    # 極座標 -> 直交座標
+    theta_rad = math.radians(-theta_deg)
+    target_x = r * math.sin(theta_rad)
+    target_y = -r * math.cos(theta_rad)
+    target_z = z
+    target_pos = np.array([target_x, target_y, target_z])
 
-    cos_beta = (L1_UPPER_ARM**2 + L2_LOWER_ARM**2 - d_sq) / (2.0 * L1_UPPER_ARM * L2_LOWER_ARM)
-    cos_beta = max(-1.0, min(1.0, cos_beta))
-    beta = math.acos(cos_beta)
+    # 安定した初期姿勢 (肘上げ・前傾)[cite: 2]
+    init_qpos = np.array([theta_rad, 1.4, -2.0, -0.4, 0.0, 0.0])
+    _IK_DATA.qpos[:6] = init_qpos
+    mujoco.mj_forward(_IK_MODEL, _IK_DATA)
 
-    # 3. MuJoCo 各ジョイント qpos への直接解法[cite: 2]
-    # Joint 1: 台座旋回
-    qpos_1 = theta_rad
+    jacp = np.zeros((3, _IK_MODEL.nv))
 
-    # Joint 2: 肩ピッチ (Elbow Up: 仰角 + alpha)[cite: 2]
-    phi_shoulder = math.atan2(z_w, r_w) + alpha
-    qpos_2 = phi_shoulder + 1.8000
+    for step in range(max_steps):
+        # 爪先端 (TCP) のグローバル座標を計算 (jaw 原点 + 回転オフセット)[cite: 2]
+        rot_mat = _IK_DATA.xmat[_JAW_BODY_ID].reshape(3, 3)
+        current_tip_pos = _IK_DATA.xpos[_JAW_BODY_ID] + rot_mat @ JAW_LOCAL_TCP_OFFSET
+        
+        error = target_pos - current_tip_pos
 
-    # Joint 3: 肘ピッチ (外側へ屈曲する Elbow Up 姿勢)[cite: 2]
-    qpos_3 = -(math.pi - beta)
+        if np.linalg.norm(error) < tol_pos:
+            break
 
-    # Joint 4: 手首ピッチ (手先ピッチ角 pitch_rad を机面に対して維持)[cite: 2]
-    qpos_4 = pitch_rad - phi_shoulder - (qpos_3 + 1.5708) + 1.0000
+        # 爪先端グローバル位置に対するヤコビアンを計算[cite: 2]
+        mujoco.mj_jac(_IK_MODEL, _IK_DATA, jacp, None, current_tip_pos, _JAW_BODY_ID)
+        J = jacp[:, :4]  # アーム4軸 (ID 1〜4)
 
-    # 4. ラジアンからサーボ Raw カウント値へ変換[cite: 4, 13]
+        # DLS 逆行列計算
+        J_inv = J.T @ np.linalg.inv(J @ J.T + damping**2 * np.eye(3))
+        delta_q = J_inv @ error
+
+        delta_q = np.clip(delta_q, -0.25, 0.25)
+        _IK_DATA.qpos[:4] += delta_q
+        mujoco.mj_forward(_IK_MODEL, _IK_DATA)
+
+    # 爪先端の最終位置誤差チェック
+    rot_mat = _IK_DATA.xmat[_JAW_BODY_ID].reshape(3, 3)
+    final_tip_pos = _IK_DATA.xpos[_JAW_BODY_ID] + rot_mat @ JAW_LOCAL_TCP_OFFSET
+    if np.linalg.norm(target_pos - final_tip_pos) > 0.020:
+        return None
+
     raw_targets = {
-        1: radian_to_raw(1, qpos_1),
-        2: radian_to_raw(2, qpos_2),
-        3: radian_to_raw(3, qpos_3),
-        4: radian_to_raw(4, qpos_4),
+        1: radian_to_raw(1, _IK_DATA.qpos[0]),
+        2: radian_to_raw(2, _IK_DATA.qpos[1]),
+        3: radian_to_raw(3, _IK_DATA.qpos[2]),
+        4: radian_to_raw(4, _IK_DATA.qpos[3]),
         5: SIM_OFFSETS.get(5, 3050),
         6: JOINT_CONFIG[6]["init"],
     }
 
-    # 可動限界チェック (アーム軸 ID 1〜4)[cite: 4, 13]
+    # 可動限界チェック (Bounded 軸)[cite: 4]
     for sid in [1, 2, 3, 4]:
         cfg = JOINT_CONFIG.get(sid)
         if cfg and cfg["type"] == "bounded":
-            f_min = cfg["f_min"]
-            f_max = cfg["f_max"]
-            if not (f_min <= raw_targets[sid] <= f_max):
+            if not (cfg["f_min"] <= raw_targets[sid] <= cfg["f_max"]):
                 return None
 
     return raw_targets
