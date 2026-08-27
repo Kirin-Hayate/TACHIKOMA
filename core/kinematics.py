@@ -5,8 +5,8 @@
 【役割】
 1. リーダーアームの生値 (Raw: 0〜4095) をフォロワーアームの目標値 (Target: 0〜4095) へ変換
 2. フォロワー目標値 (0〜4095) と MuJoCo ラジアン角 (-π〜+π) の双方向変換
-3. MuJoCo 内蔵ヤコビアン数値IK (位置＋真下向き姿勢拘束):
-   目標極座標 (r, theta, z) から各関節目標 Raw 値の算出
+3. MuJoCo 内蔵ヤコビアン数値IK: 目標極座標 (r, theta, z) から各関節目標 Raw 値の算出
+4. 床面衝突・めり込み防止ガード (check_ground_penetration)
 ==============================================================================
 """
 
@@ -104,16 +104,43 @@ def radian_to_raw(sid: int, angle_rad: float) -> int:
 JAW_LOCAL_TCP_OFFSET = np.array([0.0, -0.045, 0.0])
 
 
+def check_ground_penetration(min_z_threshold: float = 0.002) -> bool:
+    """
+    全ジオメトリ(geom)の位置を走査し、机面(z=0)より下へのめり込みを感知する
+    """
+    if _IK_MODEL is None or _IK_DATA is None:
+        return False
+
+    for geom_id in range(_IK_MODEL.ngeom):
+        geom_z = _IK_DATA.geom_xpos[geom_id][2]
+        geom_name = mujoco.mj_id2name(_IK_MODEL, mujoco.mjtObj.mjOBJ_GEOM, geom_id)
+        if geom_name and "floor" in geom_name.lower():
+            continue
+
+        if geom_z < min_z_threshold:
+            return True  # めり込み感知
+    return False
+
+
 def solve_ik_polar(
     r: float, 
     theta_deg: float, 
     z: float, 
     max_steps: int = 40, 
     tol_pos: float = 2e-3, 
-    damping: float = 0.015
+    damping: float = 0.015,
+    prevent_penetration: bool = True,
+    min_z_threshold: float = 0.002
 ) -> Optional[Dict[int, int]]:
     """
     極座標 (r, theta, z) から SO-ARM100 の「爪先端」を目標位置へ誘導する (ヤコビアンDLS法)[cite: 2]
+    
+    Parameters:
+        r (float): アーム旋回中心からの水平距離 [m]
+        theta_deg (float): 旋回角度 [度] (0: 正面, 正: 右, 負: 左)
+        z (float): 机上面からの爪先端高さ [m]
+        prevent_penetration (bool): Trueの場合、床面(z<=min_z_threshold)へのめり込み時にNoneを返す
+        min_z_threshold (float): めり込み検知の閾値高さ [m] (デフォルト: 2mm)
     """
     if _IK_MODEL is None or _IK_DATA is None or _JAW_BODY_ID == -1:
         return None
@@ -154,12 +181,17 @@ def solve_ik_polar(
         _IK_DATA.qpos[:4] += delta_q
         mujoco.mj_forward(_IK_MODEL, _IK_DATA)
 
-    # 爪先端の最終位置誤差チェック
+    # 1. 爪先端の最終位置誤差チェック
     rot_mat = _IK_DATA.xmat[_JAW_BODY_ID].reshape(3, 3)
     final_tip_pos = _IK_DATA.xpos[_JAW_BODY_ID] + rot_mat @ JAW_LOCAL_TCP_OFFSET
     if np.linalg.norm(target_pos - final_tip_pos) > 0.020:
         return None
 
+    # 2. 床面めり込み検知チェック
+    if prevent_penetration and check_ground_penetration(min_z_threshold=min_z_threshold):
+        return None
+
+    # 3. サーボ Raw 値変換[cite: 4]
     raw_targets = {
         1: radian_to_raw(1, _IK_DATA.qpos[0]),
         2: radian_to_raw(2, _IK_DATA.qpos[1]),
@@ -169,7 +201,7 @@ def solve_ik_polar(
         6: JOINT_CONFIG[6]["init"],
     }
 
-    # 可動限界チェック (Bounded 軸)[cite: 4]
+    # 4. 可動限界チェック (Bounded 軸)[cite: 4]
     for sid in [1, 2, 3, 4]:
         cfg = JOINT_CONFIG.get(sid)
         if cfg and cfg["type"] == "bounded":
