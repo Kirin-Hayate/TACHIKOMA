@@ -42,7 +42,7 @@ if _IK_MODEL is not None:
 # ==============================================================================
 # 🛠️ 幾何・経由パラメータ
 # ==============================================================================
-L_GRIPPER = 0.150         # 手首関節から爪先端までの実効長 [m] (10.5cm)
+L_GRIPPER = 0.160         # 手首関節から爪先端までの実効長 [m] (16cm)
 DELTA_Z_WRIST_WP = 0.050  # 手首目標に対する手首経由点の上空オフセット [m] (5cm)
 DEFAULT_APPROACH_DEG = 90.0  # デフォルト進入角度 (度)
 MIN_APPROACH_DEG = 30.0      # フォールバック最小許容角度 (度)
@@ -57,7 +57,8 @@ def solve_ik_wrist_and_pitch(
 ) -> dict | None:
     """
     手首関節(ID 4)を (r_wrist, theta, z_wrist) に配置し、
-    手先が地面に対して下向きに折れ曲がるよう全4軸を確定する
+    進入角度 target_pitch_deg (90°=垂直, 80°, 70°...) に応じて
+    手先を前方（外側）へ正しく倒す
     """
     if _IK_MODEL is None or _IK_DATA is None or _WRIST_BODY_ID == -1:
         return None
@@ -75,7 +76,7 @@ def solve_ik_wrist_and_pitch(
 
     jacp = np.zeros((3, _IK_MODEL.nv))
 
-    # ステップ 1: ID 1〜3 (旋回・肩・肘) で手首関節を目標座標へ誘導
+    # ステップ 1: ID 1〜3 で手首関節を目標座標へ誘導
     for _ in range(40):
         current_wrist_pos = _IK_DATA.xpos[_WRIST_BODY_ID]
         error = target_wrist_pos - current_wrist_pos
@@ -96,11 +97,13 @@ def solve_ik_wrist_and_pitch(
     if np.linalg.norm(target_wrist_pos - final_wrist_pos) > 0.020:
         return None
 
-    # ステップ 2: 逆方向へシフトして真下に折り曲げる
+    # ステップ 2: 90°(垂直)基準から、角度が寝る分だけ前方（外向き）へ倒す
     q2 = _IK_DATA.qpos[1]
     q3 = _IK_DATA.qpos[2]
-    pitch_rad = math.radians(target_pitch_deg)
-    q4 = -(pitch_rad + q2 + q3 - (math.pi)*0.9)
+    delta_pitch_rad = math.radians(90.0 - target_pitch_deg)
+
+    # 前方へ倒すため delta_pitch_rad を減算
+    q4 = -(math.radians(90.0) + q2 + q3 - (math.pi * 0.9)) - delta_pitch_rad
     _IK_DATA.qpos[3] = q4
     mujoco.mj_forward(_IK_MODEL, _IK_DATA)
 
@@ -116,7 +119,6 @@ def solve_ik_wrist_and_pitch(
         6: JOINT_CONFIG[6]["init"],
     }
 
-    # サーボ可動限界チェック
     for sid in [1, 2, 3, 4]:
         cfg = JOINT_CONFIG.get(sid)
         if cfg and cfg["type"] == "bounded":
@@ -138,11 +140,11 @@ def solve_ik_adaptive_approach(
     for pitch_deg in np.arange(init_pitch_deg, MIN_APPROACH_DEG - 1.0, -5.0):
         pitch_rad = math.radians(pitch_deg)
 
-        # 1. 爪先と進入角から手首目標位置を幾何逆算
+        # 爪先と進入角から手首目標位置を幾何逆算
         r_wrist_target = r_tcp - L_GRIPPER * math.cos(pitch_rad)
         z_wrist_target = z_tcp + L_GRIPPER * math.sin(pitch_rad)
 
-        # 2. 手首経由点 (手首目標の指定cm真上)
+        # 手首経由点 (手首目標の指定cm真上)
         r_wrist_wp = r_wrist_target
         z_wrist_wp = z_wrist_target + DELTA_Z_WRIST_WP
 
