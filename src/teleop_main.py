@@ -1,27 +1,39 @@
 """
 ==============================================================================
-TACHIKOMA 統合遠隔操作スクリプト (src/teleop_main.py)
+TACHIKOMA 統合遠隔操作スクリプト (ラジアン統一版)
+(src/teleop_main.py)
 ==============================================================================
 【役割】
-コマンドライン引数（実行時オプション）によって、以下の3機能を自由に組み合わせて実行します。
+リーダーアーム（操作側）の動きをリアルタイムに読み取り、フォロワーアーム（追従側）
+および 3D シミュレータへ伝達します。
+内部演算および CSV 記録データを「物理関節ラジアン」で統一しており、
+記録したファイルはそのまま `replay_main.py` で完全互換再生が可能です。
+
+コマンドライン引数（実行時オプション）によって、以下の機能を自由に組み合わせられます:
   1. 実機フォロワーの追従  （デフォルト: OFF / 有効化: --arm）
-  2. 画面上の3D描画       （デフォルト: OFF / 有効化: --sim）
-  3. 動作データのCSV記録  （デフォルト: OFF / 有効化: --record）
+  2. 画面上の 3D 描画     （デフォルト: OFF / 有効化: --sim）
+  3. 動作データの CSV 記録（デフォルト: OFF / 有効化: --record）
 
 【安全機能】
-- 起動時アプローチ補間（急発進防止）:
-  メインループ開始前に、トルクOFF状態で実機フォロワーの現在姿勢を読み取り、
-  リーダーアームの初期姿勢へ「コサインS字補間（初速0）」でゆっくり移動してから
-  50Hzのリアルタイム遠隔操作へ移行します。
+1. 起動時アプローチ補間（急発進防止）:
+   メインループ開始前に、トルク OFF 状態で実機フォロワーの現在姿勢を読み取ります。
+   そこからリーダーアームの初期姿勢へ「コサイン S 字補間（初速 0）」で
+   ゆっくり移動してから、50Hz のリアルタイム遠隔操作へ移行します。
+2. ハードウェア境界での Raw 値変換:
+   演算・記録・画面描画はすべて物理ラジアン角で行い、実機サーボへの送信直前にのみ
+   `radian_to_raw()` を通して書き込みます。
 
 【実行コマンド例】
-  - 画面シミュレーションのみ（安全なテスト用）
+  - 画面シミュレーションのみ（安全な動作確認用）
       python src/teleop_main.py --sim
-  - 実機同期 ＋ 画面表示
+
+  - 実機同期 ＋ 画面表示（通常の遠隔操作）
       python src/teleop_main.py --arm --sim
-  - 実機同期 ＋ 画面表示 ＋ CSV記録（フル稼働）
+
+  - 実機同期 ＋ 画面表示 ＋ ラジアン CSV 記録（モーションティーチング）
       python src/teleop_main.py --arm --sim --record
-  - 実機同期のみ
+
+  - 実機同期のみ（画面なし・軽量動作）
       python src/teleop_main.py --arm
 ==============================================================================
 """
@@ -50,10 +62,15 @@ from config.joint_config import (
     JOINT_CONFIG
 )
 from core.sts3215 import STS3215Driver
-from core.kinematics import calculate_target
+from core.kinematics import (
+    raw_to_radian,
+    radian_to_raw,
+    calculate_target_rad,
+    get_home_radians
+)
 from core.sim_viewer import MujocoSimViewer
 
-# 起動時にリーダーの姿勢へ合わせる秒数
+# 起動時にリーダーの姿勢へフォロワーを合わせる秒数
 STARTUP_APPROACH_DURATION = 2.5
 
 
@@ -63,39 +80,39 @@ STARTUP_APPROACH_DURATION = 2.5
 def parse_arguments():
     """コマンドライン引数を定義・取得する関数"""
     parser = argparse.ArgumentParser(
-        description="TACHIKOMA リアルタイム遠隔操作 統合メインスクリプト"
+        description="TACHIKOMA リアルタイム遠隔操作スクリプト (ラジアン統一版)"
     )
 
-    # --arm オプション (指定すると True になり、実機フォロワーへ送信する)
+    # --arm オプション (実機フォロワーへ送信する)
     parser.add_argument(
         "--arm",
         action="store_true",
         help="実機フォロワーへのコマンド送信・追従動作を有効化します（デフォルト: OFF）"
     )
 
-    # --sim オプション (指定すると True になる)
+    # --sim オプション (3D シミュレータを描画する)
     parser.add_argument(
         "--sim",
         action="store_true",
         help="MuJoCo 3Dシミュレーション描画ウィンドウを起動します（デフォルト: OFF）"
     )
 
-    # --record オプション (指定すると True になる)
+    # --record オプション (ラジアン CSV を保存する)
     parser.add_argument(
         "--record",
         action="store_true",
-        help="CSVファイルへの動作データ記録を有効化します（デフォルト: OFF）"
+        help="CSVファイルへのラジアン動作データ記録を有効化します（デフォルト: OFF）"
     )
 
     return parser.parse_args()
 
 
 # ==============================================================================
-# 3. 補助関数 (安全なS字補間)
+# 3. 補助関数 (安全な S 字補間)
 # ==============================================================================
-def smooth_move(follower_driver, sim_viewer, start_positions, target_positions, duration=2.5, steps=75):
+def smooth_move_rad(follower_driver, sim_viewer, start_rad, target_rad, duration=2.5, steps=75):
     """
-    開始姿勢から目標姿勢へコサインS字加減速で滑らかに移動する。
+    開始姿勢から目標姿勢へコサイン S 字加減速で滑らかに移動する（ラジアン空間）。
     初速と終速がゼロになるため、モーターへの過負荷や急発進が起きません。
     """
     interval = duration / steps
@@ -103,18 +120,21 @@ def smooth_move(follower_driver, sim_viewer, start_positions, target_positions, 
         t = step / steps
         ratio = (1.0 - math.cos(t * math.pi)) / 2.0
 
-        current_step_positions = {}
+        current_step_rad = {}
         for sid in SERVO_IDS:
-            start_p = start_positions.get(sid, JOINT_CONFIG[sid]["init"])
-            target_p = target_positions.get(sid, JOINT_CONFIG[sid]["init"])
-            current_p = int(start_p + ratio * (target_p - start_p))
-            current_step_positions[sid] = current_p
+            s_val = start_rad.get(sid, 0.0)
+            e_val = target_rad.get(sid, 0.0)
+            cur_val = s_val + ratio * (e_val - s_val)
+            current_step_rad[sid] = cur_val
 
+            # 実機フォロワー送信時のみ Raw 値に変換
             if follower_driver is not None:
-                follower_driver.write_position(sid, current_p)
+                raw_val = radian_to_raw(sid, cur_val)
+                follower_driver.write_position(sid, raw_val)
 
+        # 3D シミュレータ側はラジアンのまま直接反映
         if sim_viewer is not None:
-            sim_viewer.update_joints(current_step_positions)
+            sim_viewer.update_joints_rad(current_step_rad)
 
         time.sleep(interval)
 
@@ -125,24 +145,22 @@ def smooth_move(follower_driver, sim_viewer, start_positions, target_positions, 
 def main():
     args = parse_arguments()
 
-    # 引数から各機能の有効/無効フラグを決定
     enable_follower = args.arm
     enable_sim = args.sim
     enable_record = args.record
 
-    # 動作モードの表示文字列を作成
     mode_list = []
     if enable_follower:
         mode_list.append("🤖 実機フォロワー同期")
     if enable_sim:
         mode_list.append("🖥️ 3D画面描画")
     if enable_record:
-        mode_list.append("📁 CSV記録")
+        mode_list.append("📁 ラジアンCSV記録")
     if not mode_list:
         mode_list.append("ターミナル数値モニタのみ")
 
     print("==================================================")
-    print(f" 🎬 TACHIKOMA 統合制御システム")
+    print(" 🎬 TACHIKOMA 統合遠隔操作システム (ラジアン統一版)")
     print(f" ⚙️ 有効機能: {' + '.join(mode_list)}")
     print("==================================================")
 
@@ -154,7 +172,7 @@ def main():
     if enable_record:
         motions_dir = os.path.join(BASE_DIR, "motions")
         os.makedirs(motions_dir, exist_ok=True)
-        filename = f"motion_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        filename = f"teleop_rad_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
         output_filepath = os.path.join(motions_dir, filename)
         print(f"📁 記録先: {output_filepath}")
 
@@ -183,7 +201,7 @@ def main():
     else:
         print("💡 --arm が指定されていないため、実機フォロワーは動作しません（安全モード）。")
 
-    # --- 3. MuJoCo 3Dシミュレータの初期化判定 ---
+    # --- 3. MuJoCo 3D シミュレータの初期化判定 ---
     if enable_sim:
         try:
             sim = MujocoSimViewer()
@@ -194,11 +212,11 @@ def main():
     else:
         print("💡 --sim が指定されていないため、3D画面描画はスキップします。")
 
-    # --- 4. CSV記録ファイルのオープン ---
+    # --- 4. CSV 記録ファイルのオープン (ラジアンヘッダー: q1〜q6) ---
     if enable_record:
         csv_file = open(output_filepath, mode='w', newline='', encoding='utf-8')
         csv_writer = csv.writer(csv_file)
-        header = ["timestamp_sec"] + [f"id_{sid}" for sid in SERVO_IDS]
+        header = ["timestamp_sec", "q1", "q2", "q3", "q4", "q5", "q6"]
         csv_writer.writerow(header)
 
     # 追従計算用キャッシュの準備
@@ -207,12 +225,12 @@ def main():
     last_valid_positions = {sid: 2048 for sid in SERVO_IDS}
 
     # --------------------------------------------------------------------------
-    # 🛡️ 【解決策1】起動時アプローチ補間（現在姿勢 ➔ リーダー初期姿勢）
+    # 🛡️ 起動時アプローチ補間（現在姿勢 ➔ リーダー初期姿勢）
     # --------------------------------------------------------------------------
     print("\n🔍 リーダーおよびフォロワーの初期姿勢をスキャン中...")
     initial_leader_raw = {}
-    initial_targets = {}
-    follower_startup_pos = {}
+    initial_targets_rad = {}
+    follower_startup_rad = {}
 
     # リーダーの現在姿勢を全軸読み取り
     for sid in SERVO_IDS:
@@ -220,34 +238,34 @@ def main():
         initial_leader_raw[sid] = pos if pos is not None else 2048
         last_valid_positions[sid] = initial_leader_raw[sid]
 
-    # リーダー初期姿勢に対応するフォロワー目標値を計算
+    # リーダー初期姿勢に対応するフォロワー目標ラジアンを計算
     for sid in SERVO_IDS:
-        target_val = calculate_target(sid, initial_leader_raw[sid], prev_leader_cache, follower_current_cache)
-        initial_targets[sid] = target_val
+        target_rad = calculate_target_rad(sid, initial_leader_raw[sid], prev_leader_cache, follower_current_cache)
+        initial_targets_rad[sid] = target_rad
         prev_leader_cache[sid] = initial_leader_raw[sid]
-        follower_current_cache[sid] = target_val
+        follower_current_cache[sid] = radian_to_raw(sid, target_rad)
 
-    # 実機フォロワーの静止姿勢をスキャン（トルクOFF安全状態）
+    # 実機フォロワーの静止姿勢をスキャン（トルク OFF 安全状態）
     if is_follower_active:
         for sid in SERVO_IDS:
             pos = follower.read_position(sid)
-            follower_startup_pos[sid] = pos if pos is not None else initial_targets[sid]
-        
-        # 読み取った角度を保持した状態でトルクON
+            follower_startup_rad[sid] = raw_to_radian(sid, pos) if pos is not None else initial_targets_rad[sid]
+
+        # 読み取った角度を保持した状態でトルク ON
         for sid in SERVO_IDS:
-            follower.write_position(sid, follower_startup_pos[sid])
+            follower.write_position(sid, radian_to_raw(sid, follower_startup_rad[sid]))
             follower.set_torque(sid, True)
     else:
-        follower_startup_pos = dict(initial_targets)
+        follower_startup_rad = dict(initial_targets_rad)
 
-    # 3Dモデル画面を初期姿勢に同期
+    # 3D モデル画面を初期姿勢に同期
     if sim is not None:
-        sim.update_joints(follower_startup_pos)
+        sim.update_joints_rad(follower_startup_rad)
 
-    # S字補間でリーダーの現在姿勢へゆっくりアプローチ
+    # S 字補間でリーダーの現在姿勢へゆっくりアプローチ
     if is_follower_active or sim is not None:
         print(f"🎯 フォロワーをリーダーの現在姿勢へ同期中 ({STARTUP_APPROACH_DURATION}秒)...")
-        smooth_move(follower, sim, follower_startup_pos, initial_targets, duration=STARTUP_APPROACH_DURATION)
+        smooth_move_rad(follower, sim, follower_startup_rad, initial_targets_rad, duration=STARTUP_APPROACH_DURATION)
         print("✅ 同期完了！リアルタイム遠隔操作を開始します。\n")
 
     print("👉 リーダーアームを操作してください。")
@@ -263,11 +281,9 @@ def main():
     sys.stdout.flush()
 
     try:
-        # メインループ関数 (50Hzリアルタイム制御)
         def run_loop():
             nonlocal frame_count, first_draw
             while True:
-                # 3D画面が有効かつウィンドウが閉じられたら終了
                 if sim is not None and not sim.is_running():
                     break
 
@@ -275,14 +291,14 @@ def main():
                 current_timestamp = loop_start - start_time
 
                 current_csv_row = [f"{current_timestamp:.4f}"] if enable_record else []
-                target_positions = {}
+                target_positions_rad = {}
 
                 # ターミナル表示文字列の作成
                 lines = []
-                lines.append("========================================")
+                lines.append("=========================================================")
                 lines.append(f" ⏱️ 動作中  {current_timestamp:5.2f}s [{frame_count:5d} frames]")
                 lines.append(f" 🤖 実機: {'ON' if is_follower_active else 'OFF'} | 🖥️ 3D: {'ON' if sim is not None else 'OFF'} | 📁 記録: {'ON' if enable_record else 'OFF'}")
-                lines.append("========================================")
+                lines.append("---------------------------------------------------------")
 
                 # --- 各軸の読み取り・計算・送信 ---
                 for sid in SERVO_IDS:
@@ -292,27 +308,30 @@ def main():
 
                     current_raw = last_valid_positions[sid]
 
-                    # CSV記録用データへ追加
-                    if enable_record:
-                        current_csv_row.append(current_raw)
+                    # 目標ラジアン計算
+                    target_rad = calculate_target_rad(sid, current_raw, prev_leader_cache, follower_current_cache)
+                    target_positions_rad[sid] = target_rad
 
-                    # 目標値計算 (0〜4095)
-                    target_pos = calculate_target(sid, current_raw, prev_leader_cache, follower_current_cache)
+                    target_raw = radian_to_raw(sid, target_rad)
                     prev_leader_cache[sid] = current_raw
-                    follower_current_cache[sid] = target_pos
-                    target_positions[sid] = target_pos
+                    follower_current_cache[sid] = target_raw
 
-                    # 実機フォロワーへ送信（--arm 指定時のみ）
+                    # CSV 記録用データ（ラジアン）へ追加
+                    if enable_record:
+                        current_csv_row.append(f"{target_rad:.5f}")
+
+                    # 実機フォロワーへ送信（--arm 指定時のみ Raw 値で送信）
                     if is_follower_active:
-                        follower.write_position(sid, target_pos)
+                        follower.write_position(sid, target_raw)
 
-                    lines.append(f" [ID {sid}]  Raw: {current_raw:4d}  |  Target: {target_pos:4d}")
+                    deg_val = math.degrees(target_rad)
+                    lines.append(f" [ID {sid}] Raw: {current_raw:4d} ➔ Target: {target_rad:+6.3f} rad ({deg_val:+6.1f}°)")
 
-                # 3Dモデルの描画更新（--sim 指定時のみ）
+                # 3D モデルの描画更新（ラジアン直接反映）
                 if sim is not None:
-                    sim.update_joints(target_positions)
+                    sim.update_joints_rad(target_positions_rad)
 
-                lines.append("========================================")
+                lines.append("=========================================================")
                 lines.append(" [Ctrl+C] で終了")
 
                 # コンソール上書き表示
@@ -324,19 +343,18 @@ def main():
                 sys.stdout.write("\n".join(line + "\033[K" for line in lines) + "\n")
                 sys.stdout.flush()
 
-                # CSV書き込み（--record 指定時のみ）
+                # CSV 書き込み
                 if enable_record and csv_writer:
                     csv_writer.writerow(current_csv_row)
 
                 frame_count += 1
 
-                # 50Hz周期を維持
+                # 50Hz 周期の維持
                 elapsed = time.time() - loop_start
                 sleep_time = interval - elapsed
                 if sleep_time > 0:
                     time.sleep(sleep_time)
 
-        # 3D画面が有効なら launch コンテキスト内で実行、無効なら通常実行
         if sim is not None:
             with sim.launch():
                 run_loop()
@@ -346,7 +364,7 @@ def main():
     except KeyboardInterrupt:
         sys.stdout.write("\033[?25h\n\n🛑 停止しました。\n")
         if enable_record:
-            print(f"📁 計 {frame_count} フレームを '{output_filepath}' に保存しました。")
+            print(f"📁 計 {frame_count} フレームをラジアン形式で '{output_filepath}' に保存しました。")
     except Exception as e:
         sys.stdout.write("\033[?25h")
         print(f"\n❌ エラー: {e}")
