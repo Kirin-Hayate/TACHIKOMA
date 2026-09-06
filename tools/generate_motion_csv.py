@@ -131,16 +131,16 @@ def main():
     print(" 🚀 Pick & Place 軌道 CSV エクスポート (低速高密度・たわみ補正版)")
     print("=======================================================================")
 
-    # たわみを考慮し、デフォルト高さを 15mm ➔ 25mm にオフセット
+    # たわみを考慮し、デフォルト高さを 15mm ➔ 45mm にオフセット
     if args.pick is not None:
         p_dist, p_deg, p_z = args.pick
     else:
-        p_dist, p_deg, p_z = 25.0, -30.0, 25.0
+        p_dist, p_deg, p_z = 25.0, -30.0, 45.0
 
     if args.place is not None:
         pl_dist, pl_deg, pl_z = args.place
     else:
-        pl_dist, pl_deg, pl_z = 30.0, 0.0, 25.0
+        pl_dist, pl_deg, pl_z = 30.0, 0.0, 45.0
 
     pick_r, pick_th, pick_z = p_dist / 100.0, p_deg, p_z / 1000.0
     place_r, place_th, place_z = pl_dist / 100.0, pl_deg, pl_z / 1000.0
