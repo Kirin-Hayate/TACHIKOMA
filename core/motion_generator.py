@@ -1,127 +1,146 @@
 """
 ==============================================================================
-円筒座標パラメータ駆動型 モーションジェネレータ (ラジアン統一版)
-(core/motion_generator.py)
+動的 IK 軌道ジェネレータ (core/motion_generator.py)
 ==============================================================================
 【役割】
-基準テンプレート CSV (Pick & Place 動作: ラジアン形式) をベースに、
-指定された旋回角度 (theta_pick_rad, theta_place_rad) に応じて
-ID 1 (台座旋回) の軌道を動的に再計算したモーションフレーム配列を生成します。
+固定テンプレート CSV に依存せず、与えられた Pick 座標と Place 座標 [r, theta, z] から
+その場で直接 MuJoCo ヤコビアン逆運動学 (IK) を解き、全軸の物理ラジアン軌道を生成します。
 
-【処理の流れ】
-1. ラジアン CSV (q1〜q6) からフレーム配列をロード。
-2. 掴み〜持ち上げ区間 (Phase 1): ID 1 を theta_pick_rad で固定。
-3. 旋回区間 (Phase 2): コサイン S 字補間で theta_pick_rad から theta_place_rad へ補間。
-4. 下降〜離し区間 (Phase 3): ID 1 を theta_place_rad で固定。
-5. 復帰区間 (Phase 4): コサイン S 字補間で theta_place_rad から Home 旋回角 (0 rad) へ復帰。
+【動作シーケンス設計】
+1. フェーズ a (進入アプローチ):
+   Home ➔ Pick上空 (200 steps / 4.0秒: ゆったり大移動) ➔ 把持点降下 (50 steps / 1.0秒)
+2. フェーズ b (把持・移載):
+   把持 (24 steps / 0.48秒) ➔ 持ち上げ (36 steps / 0.72秒) ➔
+   Place上空へ旋回・伸縮 (70 steps / 1.4秒) ➔ 接地降下 (36 steps / 0.72秒) ➔ 開放 (24 steps / 0.48秒)
+3. フェーズ c (退避・帰還):
+   Place上空退避 (50 steps / 1.0秒) ➔ Home復帰 (200 steps / 4.0秒: ゆったり大移動)
 ==============================================================================
 """
 
 import os
 import sys
-import csv
 import math
+from typing import Dict, List, Tuple
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if BASE_DIR not in sys.path:
     sys.path.append(BASE_DIR)
 
-from config.joint_config import SERVO_IDS
-from core.kinematics import raw_to_radian
-
-# 境界フレーム定義 (rad_tuned.csv のステップ構成に準拠)
-# フェーズ a: 0〜249, フェーズ b: 250〜439, フェーズ c: 440〜589
-FRAME_ROTATE_START = 310  # 持ち上げ完了・旋回開始
-FRAME_ROTATE_END   = 380  # 旋回終了・下降開始
-FRAME_PLACE_END    = 440  # 離し完了・Home復帰開始
+from config.joint_config import SERVO_IDS, SAMPLING_RATE_HZ
+from core.kinematics import (
+    get_home_radians,
+    solve_ik_adaptive_approach,
+    GRIPPER_OPEN_RAD,
+    GRIPPER_CLOSE_RAD
+)
 
 
 class ParametricMotionGenerator:
     def __init__(self, template_csv=None):
-        if template_csv is None:
-            template_csv = "rad_tuned.csv"
-        resolved_path = self._resolve_path(template_csv)
-        self.template_frames = self._load_template(resolved_path)
+        """
+        初期化: 基準となる Home 姿勢のラジアン配列を読み込む
+        (引数 template_csv は互換性のために残していますが、ファイルには依存しません)
+        """
+        self.home_rad = get_home_radians()
 
-    def _resolve_path(self, filepath):
-        # 1. 指定されたパスそのまま
-        if os.path.exists(filepath):
-            return filepath
-        # 2. motions/ フォルダ配下
-        candidate1 = os.path.join(BASE_DIR, "motions", os.path.basename(filepath))
-        if os.path.exists(candidate1):
-            return candidate1
-        # 3. プロジェクトルートからの相対パス
-        candidate2 = os.path.join(BASE_DIR, filepath)
-        if os.path.exists(candidate2):
-            return candidate2
-
-        raise FileNotFoundError(
-            f"❌ テンプレートCSVが見つかりません: {filepath}\n"
-            f"   'python tools/generate_motion_csv.py --output motions/{os.path.basename(filepath)}' を実行して生成してください。"
-        )
-
-    def _load_template(self, filepath):
-        """CSV からラジアンフレーム配列を読み込む (旧 Raw 形式も自動対応)"""
+    def _interpolate_segment(self, start_rad: dict, end_rad: dict, steps: int) -> list:
+        """
+        開始姿勢から目標姿勢へコサイン S 字加減速で補間したフレームリストを生成。
+        初速と終速がゼロになるため、モーターへの衝撃を防ぎます。
+        """
         frames = []
-        with open(filepath, mode='r', encoding='utf-8') as f:
-            reader = csv.DictReader(f)
-            headers = reader.fieldnames or []
-            is_radian = "q1" in headers
-
-            for row in reader:
-                t = float(row["timestamp_sec"])
-                positions = {}
-                for sid in SERVO_IDS:
-                    if is_radian:
-                        positions[sid] = float(row[f"q{sid}"])
-                    else:
-                        raw_val = int(row[f"id_{sid}"])
-                        positions[sid] = raw_to_radian(sid, raw_val)
-                frames.append((t, positions))
+        for step in range(1, steps + 1):
+            ratio = step / steps
+            s_ratio = (1.0 - math.cos(ratio * math.pi)) / 2.0
+            frame = {
+                sid: start_rad[sid] + s_ratio * (end_rad[sid] - start_rad[sid])
+                for sid in SERVO_IDS
+            }
+            frames.append(frame)
         return frames
 
-    def generate(self, theta_pick_rad: float, theta_place_rad: float, theta_home_rad: float = 0.0) -> list:
+    def generate_from_coords(self, pick_coord: dict, place_coord: dict) -> Tuple[bool, List, str]:
         """
-        theta_pick_rad: 掴む位置の台座旋回角 [rad] (正面 0, 右 +, 左 -)
-        theta_place_rad: 置く位置の台座旋回角 [rad]
-        theta_home_rad: 初期姿勢の旋回角 (通常 0.0 rad)
-
-        ID 1 以外の関節角度はテンプレートの滑らかな昇降・把持軌道を維持し、
-        ID 1 のみ指定された角度へ S 字補間で差し替えたフレーム配列を返します。
+        指定された Pick 座標と Place 座標から、完全な Pick & Place 軌道を動的に計算して出力する。
+        
+        引数:
+            pick_coord:  {"r": float, "theta_deg": float, "z": float}
+            place_coord: {"r": float, "theta_deg": float, "z": float}
+        戻り値:
+            (成功成否: bool, フレームリスト: [(t_sec, {sid: rad})], ログメッセージ: str)
         """
-        new_frames = []
-        total_frames = len(self.template_frames)
+        # --- 1. Pick 地点の逆運動学 (IK) を適応型進入角度で解く ---
+        ik_pk_target, ik_pk_wp, pitch_pk = solve_ik_adaptive_approach(
+            r_tcp=pick_coord["r"],
+            theta_deg=pick_coord["theta_deg"],
+            z_tcp=pick_coord["z"],
+            gripper_rad=GRIPPER_OPEN_RAD
+        )
+        if ik_pk_target is None:
+            return False, [], (
+                f"Pick 座標 (r={pick_coord['r']*100:.1f}cm, θ={pick_coord['theta_deg']:+.1f}°) "
+                f"への到達姿勢を算出できませんでした (可動域外または机面干渉)。"
+            )
 
-        # 動的境界調整 (テンプレート長が異なる場合の安全クリップ)
-        f_rot_start = min(FRAME_ROTATE_START, int(total_frames * 0.50))
-        f_rot_end   = min(FRAME_ROTATE_END, int(total_frames * 0.65))
-        f_place_end = min(FRAME_PLACE_END, int(total_frames * 0.75))
+        # --- 2. Place 地点の逆運動学 (IK) を適応型進入角度で解く ---
+        ik_pl_target, ik_pl_wp, pitch_pl = solve_ik_adaptive_approach(
+            r_tcp=place_coord["r"],
+            theta_deg=place_coord["theta_deg"],
+            z_tcp=place_coord["z"],
+            gripper_rad=GRIPPER_OPEN_RAD
+        )
+        if ik_pl_target is None:
+            return False, [], (
+                f"Place 座標 (r={place_coord['r']*100:.1f}cm, θ={place_coord['theta_deg']:+.1f}°) "
+                f"への到達姿勢を算出できませんでした (可動域外または机面干渉)。"
+            )
 
-        for idx, (t, rad_pos) in enumerate(self.template_frames):
-            frame_pos = dict(rad_pos)
+        # グリッパーを閉じた状態の姿勢辞書を作成
+        ik_pk_target_c = dict(ik_pk_target)
+        ik_pk_target_c[6] = GRIPPER_CLOSE_RAD
+        ik_pk_wp_c = dict(ik_pk_wp)
+        ik_pk_wp_c[6] = GRIPPER_CLOSE_RAD
 
-            # ID 1（旋回軸）の目標値を指定パラメータで動的に書き換え
-            if idx < f_rot_start:
-                # Phase 1: 掴み〜持ち上げまでは theta_pick
-                frame_pos[1] = theta_pick_rad
+        ik_pl_target_c = dict(ik_pl_target)
+        ik_pl_target_c[6] = GRIPPER_CLOSE_RAD
+        ik_pl_wp_c = dict(ik_pl_wp)
+        ik_pl_wp_c[6] = GRIPPER_CLOSE_RAD
 
-            elif f_rot_start <= idx <= f_rot_end:
-                # Phase 2: 旋回区間（コサイン S 字補間）
-                ratio_linear = (idx - f_rot_start) / max(1, (f_rot_end - f_rot_start))
-                s_ratio = (1.0 - math.cos(ratio_linear * math.pi)) / 2.0
-                frame_pos[1] = theta_pick_rad + s_ratio * (theta_place_rad - theta_pick_rad)
+        raw_frames = []
 
-            elif f_rot_end < idx <= f_place_end:
-                # Phase 3: 下降〜離し完了までは theta_place
-                frame_pos[1] = theta_place_rad
+        # ======================================================================
+        # 【フェーズ a: アプローチ】 大移動のため落ち着いたステップ数
+        # ======================================================================
+        # 1. Home ➔ Pick 上空 (爪: 開) : 4.0秒 (200 steps)
+        raw_frames.extend(self._interpolate_segment(self.home_rad, ik_pk_wp, steps=200))
+        # 2. Pick 上空 ➔ 把持点降下 (爪: 開) : 1.0秒 (50 steps)
+        raw_frames.extend(self._interpolate_segment(ik_pk_wp, ik_pk_target, steps=50))
 
-            else:
-                # Phase 4: Home 復帰区間
-                ratio_linear = (idx - f_place_end) / max(1, (total_frames - 1 - f_place_end))
-                s_ratio = (1.0 - math.cos(ratio_linear * math.pi)) / 2.0
-                frame_pos[1] = theta_place_rad + s_ratio * (theta_home_rad - theta_place_rad)
+        # ======================================================================
+        # 【フェーズ b: 把持・移載】 良好な速度感をそのまま維持
+        # ======================================================================
+        # 3. 把持 (爪: 閉) : 0.48秒 (24 steps)
+        raw_frames.extend(self._interpolate_segment(ik_pk_target, ik_pk_target_c, steps=24))
+        # 4. 把持点 ➔ Pick 上空持ち上げ (爪: 閉維持) : 0.72秒 (36 steps)
+        raw_frames.extend(self._interpolate_segment(ik_pk_target_c, ik_pk_wp_c, steps=36))
+        # 5. Pick 上空 ➔ Place 上空へ旋回・伸縮 (爪: 閉維持) : 3秒 (150 steps)
+        raw_frames.extend(self._interpolate_segment(ik_pk_wp_c, ik_pl_wp_c, steps=150))
+        # 6. Place 上空 ➔ 接地降下 (爪: 閉維持) : 0.72秒 (36 steps)
+        raw_frames.extend(self._interpolate_segment(ik_pl_wp_c, ik_pl_target_c, steps=36))
+        # 7. 開放 (爪: 開) : 0.48秒 (24 steps)
+        raw_frames.extend(self._interpolate_segment(ik_pl_target_c, ik_pl_target, steps=24))
 
-            new_frames.append((t, frame_pos))
+        # ======================================================================
+        # 【フェーズ c: 退避・帰還】 急激な戻りを防ぐため減速
+        # ======================================================================
+        # 8. 接地点 ➔ Place 上空退避 (爪: 開) : 1.0秒 (50 steps)
+        raw_frames.extend(self._interpolate_segment(ik_pl_target, ik_pl_wp, steps=50))
+        # 9. Place 上空 ➔ Home 復帰 (爪: 開) : 4.0秒 (200 steps)
+        raw_frames.extend(self._interpolate_segment(ik_pl_wp, self.home_rad, steps=200))
 
-        return new_frames
+        # 50Hz (0.02秒刻み) のタイムスタンプを付与
+        dt = 1.0 / SAMPLING_RATE_HZ
+        timed_frames = [(round(i * dt, 4), frame) for i, frame in enumerate(raw_frames)]
+
+        log_msg = f"IK成功 (Pick進入角={pitch_pk:.0f}°, Place進入角={pitch_pl:.0f}°)"
+        return True, timed_frames, log_msg

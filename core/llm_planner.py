@@ -1,9 +1,16 @@
 """
 ==============================================================================
-LLM タスクプランナー (core/llm_planner.py)
+TACHIKOMA 自然言語タスクプランナー (core/llm_planner.py)
 ==============================================================================
 【役割】
-単一または複数の連続搬送指示を解析し、タスクのリスト（sequence）を出力します。
+ユーザーの自然言語指示（例: 「正面の手前にあるものを右奥へ運んで」）を LLM (Gemini) に入力し、
+1. 搬送タスクの要否判定
+2. 掴み位置 (pick) と配置位置 (place) の極座標パラメータ [r, theta_deg, z] の抽出
+3. 抽出結果の JSON パースおよび物理可動限界内の安全クランプ
+を行い、構造化された実行シーケンスとして返却します。
+
+【使用ライブラリ】
+google-genai SDK (gemini-3.1-flash-lite)
 ==============================================================================
 """
 
@@ -19,73 +26,70 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if BASE_DIR not in sys.path:
     sys.path.append(BASE_DIR)
 
+# .env ファイルから API キーを読み込む
 env_path = os.path.join(BASE_DIR, ".env")
 load_dotenv(dotenv_path=env_path)
 
 from config.workspace_config import (
     LOCATION_ANGLES,
-    CENTER_RAW,
-    MIN_RAW,
-    MAX_RAW,
-    MAX_RIGHT_DEG,
-    MAX_LEFT_DEG,
-    location_to_raw
+    DISTANCE_PRESETS,
+    R_MIN_METERS,
+    R_MAX_METERS,
+    DEFAULT_Z_TCP
 )
 
 
 class LLMTaskPlanner:
     def __init__(self, api_key=None):
+        """Gemini API クライアントを初期化"""
         self.api_key = api_key or os.getenv("GEMINI_API_KEY")
         if not self.api_key:
             raise ValueError(
-                "❌ GEMINI_API_KEY が見つかりません。\n"
-                ".env ファイルを確認してください。"
+                "❌ GEMINI_API_KEY が見つかりません。.env ファイルを確認してください。"
             )
-
         self.client = genai.Client(api_key=self.api_key)
-        self.known_locations = list(LOCATION_ANGLES.keys())
 
     def plan(self, user_instruction: str) -> dict:
+        """
+        ユーザーの自然言語指示を解析し、極座標パラメータを含むタスクシーケンスを出力する
+        """
         system_instruction = (
             "あなたの名前は支援ロボットTACHIKOMAです。\n"
-            "極めて優秀な実務支援ユニットです。なお、攻殻機動隊とは関係ないです。\n\n"
-            "【ペルソナ・口調ルール】\n"
-            "・一人称は『当機』\n"
-            "・感情の起伏は一切見せず、極めて論理的、平坦、かつ簡潔な軍事・システム報告調を用いてください。\n"
-            "・余計な雑談や装飾は省き、ステータスや座標、処理結果を明瞭に伝達してください。\n"
-            "・物理動作が不要な場合は tasks を空リスト [] に設定してください。"
+            "極めて優秀な実務支援ユニットとして、論理的、平坦、かつ簡潔な軍事・システム報告調で応答してください。\n"
+            "一人称は『当機』を使用し、感情表現や雑談は含めないでください。\n"
+            "ユーザーの指示から、掴む位置(pick)と置く位置(place)の円筒極座標 [r: 半径(m), theta_deg: 角度(度), z: 高さ(m)] を特定してください。\n"
+            "物理的な搬送を伴わない対話や挨拶の場合は、tasks を空リスト [] に設定してください。"
         )
 
         prompt = f"""
-【ハードウェア仕様（ID1 台座旋回サーボ）】
-- 角度規約: 正面が 0度、右方向が ＋（プラス）、左方向が −（マイナス）
-- 基準中心 (0度): Raw値 {CENTER_RAW}
-- 物理限界（右限界 / 最大時計回り）: +{MAX_RIGHT_DEG:.1f}度 (Raw値 {MIN_RAW})
-- 物理限界（左限界 / 最大反時計回り）: {MAX_LEFT_DEG:.1f}度 (Raw値 {MAX_RAW})
-- 既知の地点・方向リスト: {json.dumps(self.known_locations, ensure_ascii=False)}
+【ハードウェア座標規約】
+- 水平距離 r [m]: 旋回軸中心からの距離。可動限界は {R_MIN_METERS}m 〜 {R_MAX_METERS}m。
+  代表値: 手前/近い({DISTANCE_PRESETS['手前']}m), 通常/指定なし({DISTANCE_PRESETS['通常']}m), 奥/遠い({DISTANCE_PRESETS['奥']}m)
+- 旋回角度 theta_deg [度]: 正面が 0.0度、時計回り(右)が ＋、反時計回り(左)が −。
+  代表値: 正面(0.0), 右前方(+20.0), 右側(+45.0), 左前方(-20.0), 左側(-45.0)
+- 高さ z [m]: 机上面からの爪先端高さ。指定がなければデフォルト値 {DEFAULT_Z_TCP}m。
 
-【ユーザーの指示】
+【ユーザー指示】
 "{user_instruction}"
 
-【出力形式要件】
-以下の JSON オブジェクトのフォーマットを厳密に返してください。
-複数の搬送指示がある場合は、tasks リストに順番通りに格納してください。
-搬送不要な対話・質問の場合は tasks を [] としてください。
-
+【出力 JSON フォーマット要件】
+以下の構造の JSON を厳密に返してください。
 {{
-  "thought": "座標・幾何パラメータおよび一連のタスク遷移の解析ログ",
-  "reply_text": "オペレーターとしてのシステム応答メッセージ",
+  "thought": "幾何パラメータの解釈および一連のタスク遷移の解析ログ",
+  "reply_text": "オペレーターに対するシステム応答メッセージ",
   "tasks": [
     {{
       "type": "pick_and_place",
-      "pick_location": "掴む位置の名称または角度",
-      "place_location": "置く位置の名称または角度"
+      "description": "タスクの簡単な要約 (例: 正面手前 ➔ 右奥へ搬送)",
+      "pick": {{"r": 0.20, "theta_deg": 0.0, "z": {DEFAULT_Z_TCP}}},
+      "place": {{"r": 0.30, "theta_deg": 30.0, "z": {DEFAULT_Z_TCP}}}
     }}
   ]
 }}
 """
 
         try:
+            # Gemini モデルを呼び出し
             response = self.client.models.generate_content(
                 model="gemini-3.1-flash-lite",
                 contents=prompt,
@@ -96,36 +100,38 @@ class LLMTaskPlanner:
                 )
             )
 
-            raw_text = response.text
-            parsed = json.loads(raw_text)
+            plan_data = json.loads(response.text)
+            if isinstance(plan_data, list):
+                plan_data = {
+                    "thought": "シーケンス抽出完了",
+                    "reply_text": "了解。指定された搬送シーケンスを実行します。",
+                    "tasks": plan_data
+                }
 
-            # 万が一トップレベルがリストで返ってきた場合のラップ救済
-            if isinstance(parsed, list):
-                plan_data = {"thought": "シーケンス抽出完了", "reply_text": "了解。指示されたシーケンスを実行します。", "tasks": parsed}
-            else:
-                plan_data = parsed
-
+            # 抽出された座標値のバリデーションと安全クランプ
             raw_tasks = plan_data.get("tasks") or []
             valid_tasks = []
 
-            for t in raw_tasks:
-                if isinstance(t, dict) and t.get("type") == "pick_and_place":
-                    p_loc = t.get("pick_location")
-                    d_loc = t.get("place_location")
-                    if p_loc is not None and d_loc is not None:
-                        t["theta_pick_raw"] = location_to_raw(p_loc)
-                        t["theta_place_raw"] = location_to_raw(d_loc)
-                        valid_tasks.append(t)
+            for task in raw_tasks:
+                if task.get("type") == "pick_and_place" and "pick" in task and "place" in task:
+                    for key in ["pick", "place"]:
+                        coord = task[key]
+                        # 半径 r を安全範囲にクランプ
+                        coord["r"] = float(max(R_MIN_METERS, min(R_MAX_METERS, coord.get("r", 0.25))))
+                        # 旋回角 theta を ±60° にクランプ
+                        coord["theta_deg"] = float(max(-60.0, min(60.0, coord.get("theta_deg", 0.0))))
+                        # 高さ z を安全範囲にクランプ
+                        coord["z"] = float(max(0.010, min(0.100, coord.get("z", DEFAULT_Z_TCP))))
+                    valid_tasks.append(task)
 
             plan_data["tasks"] = valid_tasks
             return plan_data
 
         except Exception as e:
-            print("\n🚨 [デバッグ情報] 例外が発生しました:")
             traceback.print_exc()
             return {
-                "thought": "例外検知: パラメータの解析に失敗しました。",
-                "reply_text": "エラーを検知。入力を正しく解釈できませんでした。",
+                "thought": "例外検知: 幾何パラメータの解析に失敗しました。",
+                "reply_text": "エラー。入力を正しく解釈できませんでした。",
                 "tasks": [],
                 "error": str(e)
             }
