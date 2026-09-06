@@ -133,13 +133,19 @@ def calculate_target_rad(sid: int, raw_leader: int, prev_raw_cache: dict, follow
     elif config["type"] == "infinite":
         prev_raw = prev_raw_cache.get(sid, raw_leader)
         diff = raw_leader - prev_raw
+        # 0/4095 境界跨ぎの最短経路判定
         if diff > 2048:
             diff -= 4096
         elif diff < -2048:
             diff += 4096
 
+        # 制限をかけない仮想累積カウント
         current_target = follower_current_cache.get(sid, config["init"])
         new_target = current_target + (diff * direction)
+
+        # キャッシュ更新用として辞書に仮想カウントを直接保存
+        follower_current_cache[sid] = new_target
+
         return raw_to_radian(sid, int(new_target))
 
 

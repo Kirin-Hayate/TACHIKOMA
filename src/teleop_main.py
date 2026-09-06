@@ -308,19 +308,25 @@ def main():
 
                     current_raw = last_valid_positions[sid]
 
-                    # 目標ラジアン計算
+                    # 目標ラジアン計算 (infinite 軸は内部で follower_current_cache をアンバウンド更新)
                     target_rad = calculate_target_rad(sid, current_raw, prev_leader_cache, follower_current_cache)
                     target_positions_rad[sid] = target_rad
 
+                    # 実機サーボ用の物理クランプ値 (0〜4095)
                     target_raw = radian_to_raw(sid, target_rad)
                     prev_leader_cache[sid] = current_raw
-                    follower_current_cache[sid] = target_raw
+
+                    # ★ 修正ポイント:
+                    # bounded 軸のみクランプ値を反映し、infinite 軸は calculate_target_rad 内で
+                    # 保持した仮想累積値を維持する
+                    if JOINT_CONFIG[sid]["type"] == "bounded":
+                        follower_current_cache[sid] = target_raw
 
                     # CSV 記録用データ（ラジアン）へ追加
                     if enable_record:
                         current_csv_row.append(f"{target_rad:.5f}")
 
-                    # 実機フォロワーへ送信（--arm 指定時のみ Raw 値で送信）
+                    # 実機フォロワーへ送信（--arm 指定時のみ）
                     if is_follower_active:
                         follower.write_position(sid, target_raw)
 
