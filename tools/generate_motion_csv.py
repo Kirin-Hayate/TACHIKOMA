@@ -52,7 +52,7 @@ def interpolate_segment(start_rad: dict, end_rad: dict, steps: int) -> list:
 
 def build_full_trajectory(pick_ik_tuple, place_ik_tuple, home_rad: dict) -> list:
     """
-    全動作シーケンスを生成 (ステップ数を2倍にして50Hzでの滑らかな低速動作を実現)
+    全動作シーケンスを生成 (フェーズa, c をゆったり減速、フェーズb を維持)
     """
     ik_pk_target_open, ik_pk_wp_open = pick_ik_tuple
     ik_pl_target_open, ik_pl_wp_open = place_ik_tuple
@@ -69,25 +69,35 @@ def build_full_trajectory(pick_ik_tuple, place_ik_tuple, home_rad: dict) -> list
 
     full_frames = []
 
-    # 各ステップ数を従来の約2倍にスケール (50Hzを保ったまま0.5倍速化)
-    # 1. Home ➔ Pick 上空 (爪: 開)
-    full_frames.extend(interpolate_segment(home_rad, ik_pk_wp_open, steps=50))
-    # 2. Pick 上空 ➔ 把持点降下 (爪: 開)
-    full_frames.extend(interpolate_segment(ik_pk_wp_open, ik_pk_target_open, steps=36))
-    # 3. 把持 (爪: 閉)
+    # --------------------------------------------------------------------------
+    # 【フェーズ a: アプローチ】 大移動のためステップ数を増やして落ち着いた動作に
+    # --------------------------------------------------------------------------
+    # 1. Home ➔ Pick 上空 (爪: 開) : 4.0秒
+    full_frames.extend(interpolate_segment(home_rad, ik_pk_wp_open, steps=200))
+    # 2. Pick 上空 ➔ 把持点降下 (爪: 開) : 1.0秒
+    full_frames.extend(interpolate_segment(ik_pk_wp_open, ik_pk_target_open, steps=50))
+
+    # --------------------------------------------------------------------------
+    # 【フェーズ b: 把持・移載】 現在の良い速度感をそのまま維持
+    # --------------------------------------------------------------------------
+    # 3. 把持 (爪: 閉) : 0.48秒
     full_frames.extend(interpolate_segment(ik_pk_target_open, ik_pk_target_closed, steps=24))
-    # 4. 把持点 ➔ Pick 上空持ち上げ (爪: 閉維持)
+    # 4. 把持点 ➔ Pick 上空持ち上げ (爪: 閉維持) : 0.72秒
     full_frames.extend(interpolate_segment(ik_pk_target_closed, ik_pk_wp_closed, steps=36))
-    # 5. Pick 上空 ➔ Place 上空へ旋回 (爪: 閉維持)
+    # 5. Pick 上空 ➔ Place 上空へ旋回 (爪: 閉維持) : 1.4秒
     full_frames.extend(interpolate_segment(ik_pk_wp_closed, ik_pl_wp_closed, steps=70))
-    # 6. Place 上空 ➔ 接地降下 (爪: 閉維持)
+    # 6. Place 上空 ➔ 接地降下 (爪: 閉維持) : 0.72秒
     full_frames.extend(interpolate_segment(ik_pl_wp_closed, ik_pl_target_closed, steps=36))
-    # 7. 開放 (爪: 開)
+    # 7. 開放 (爪: 開) : 0.48秒
     full_frames.extend(interpolate_segment(ik_pl_target_closed, ik_pl_target_open, steps=24))
-    # 8. 接地点 ➔ Place 上空退避 (爪: 開)
-    full_frames.extend(interpolate_segment(ik_pl_target_open, ik_pl_wp_open, steps=36))
-    # 9. Place 上空 ➔ Home 復帰 (爪: 開)
-    full_frames.extend(interpolate_segment(ik_pl_wp_open, home_rad, steps=50))
+
+    # --------------------------------------------------------------------------
+    # 【フェーズ c: 退避・帰還】 急激な戻りを防ぐためステップ数を拡張
+    # --------------------------------------------------------------------------
+    # 8. 接地点 ➔ Place 上空退避 (爪: 開) : 1.0秒
+    full_frames.extend(interpolate_segment(ik_pl_target_open, ik_pl_wp_open, steps=50))
+    # 9. Place 上空 ➔ Home 復帰 (爪: 開) : 4.0秒
+    full_frames.extend(interpolate_segment(ik_pl_wp_open, home_rad, steps=200))
 
     return full_frames
 
