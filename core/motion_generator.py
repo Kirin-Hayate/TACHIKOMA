@@ -1,11 +1,19 @@
 """
 ==============================================================================
-円筒座標パラメータ駆動型 モーションジェネレータ (core/motion_generator.py)
+円筒座標パラメータ駆動型 モーションジェネレータ (ラジアン統一版)
+(core/motion_generator.py)
 ==============================================================================
 【役割】
-基準テンプレートCSV (Pick & Place 動作) をベースに、
-指定された旋回角度 (theta_pick, theta_place) に応じて
-ID1 の軌道を動的に再計算したモーションフレーム配列を生成します。
+基準テンプレート CSV (Pick & Place 動作: ラジアン形式) をベースに、
+指定された旋回角度 (theta_pick_rad, theta_place_rad) に応じて
+ID 1 (台座旋回) の軌道を動的に再計算したモーションフレーム配列を生成します。
+
+【処理の流れ】
+1. ラジアン CSV (q1〜q6) からフレーム配列をロード。
+2. 掴み〜持ち上げ区間 (Phase 1): ID 1 を theta_pick_rad で固定。
+3. 旋回区間 (Phase 2): コサイン S 字補間で theta_pick_rad から theta_place_rad へ補間。
+4. 下降〜離し区間 (Phase 3): ID 1 を theta_place_rad で固定。
+5. 復帰区間 (Phase 4): コサイン S 字補間で theta_place_rad から Home 旋回角 (0 rad) へ復帰。
 ==============================================================================
 """
 
@@ -13,125 +21,107 @@ import os
 import sys
 import csv
 import math
-import copy
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if BASE_DIR not in sys.path:
     sys.path.append(BASE_DIR)
 
-from config.joint_config import SERVO_IDS, JOINT_CONFIG
-from core.kinematics import calculate_target
+from config.joint_config import SERVO_IDS
+from core.kinematics import raw_to_radian
 
-# 境界フレーム定義（目次ログより）
-FRAME_ROTATE_START = 2176  # 持ち上げ完了・旋回開始
-FRAME_ROTATE_END   = 2316  # 旋回終了・下降開始
-FRAME_PLACE_END    = 2999  # 離し完了・Home復帰開始
+# 境界フレーム定義 (rad_tuned.csv のステップ構成に準拠)
+# フェーズ a: 0〜249, フェーズ b: 250〜439, フェーズ c: 440〜589
+FRAME_ROTATE_START = 310  # 持ち上げ完了・旋回開始
+FRAME_ROTATE_END   = 380  # 旋回終了・下降開始
+FRAME_PLACE_END    = 440  # 離し完了・Home復帰開始
 
 
 class ParametricMotionGenerator:
-    def __init__(self, template_csv):
+    def __init__(self, template_csv=None):
+        if template_csv is None:
+            template_csv = "rad_tuned.csv"
         resolved_path = self._resolve_path(template_csv)
         self.template_frames = self._load_template(resolved_path)
 
     def _resolve_path(self, filepath):
+        # 1. 指定されたパスそのまま
         if os.path.exists(filepath):
             return filepath
-        candidate = os.path.join(BASE_DIR, "motions", os.path.basename(filepath))
-        if os.path.exists(candidate):
-            return candidate
-        raise FileNotFoundError(f"❌ テンプレートCSVが見つかりません: {filepath}")
+        # 2. motions/ フォルダ配下
+        candidate1 = os.path.join(BASE_DIR, "motions", os.path.basename(filepath))
+        if os.path.exists(candidate1):
+            return candidate1
+        # 3. プロジェクトルートからの相対パス
+        candidate2 = os.path.join(BASE_DIR, filepath)
+        if os.path.exists(candidate2):
+            return candidate2
+
+        raise FileNotFoundError(
+            f"❌ テンプレートCSVが見つかりません: {filepath}\n"
+            f"   'python tools/generate_motion_csv.py --output motions/{os.path.basename(filepath)}' を実行して生成してください。"
+        )
 
     def _load_template(self, filepath):
-        """CSVからフレーム配列を読み込む"""
+        """CSV からラジアンフレーム配列を読み込む (旧 Raw 形式も自動対応)"""
         frames = []
         with open(filepath, mode='r', encoding='utf-8') as f:
             reader = csv.DictReader(f)
+            headers = reader.fieldnames or []
+            is_radian = "q1" in headers
+
             for row in reader:
                 t = float(row["timestamp_sec"])
-                positions = {int(k.replace("id_", "")): int(v) for k, v in row.items() if k.startswith("id_")}
+                positions = {}
+                for sid in SERVO_IDS:
+                    if is_radian:
+                        positions[sid] = float(row[f"q{sid}"])
+                    else:
+                        raw_val = int(row[f"id_{sid}"])
+                        positions[sid] = raw_to_radian(sid, raw_val)
                 frames.append((t, positions))
         return frames
 
-    def generate(self, theta_pick_raw: int, theta_place_raw: int, theta_home_raw: int = 2048) -> list:
+    def generate(self, theta_pick_rad: float, theta_place_rad: float, theta_home_rad: float = 0.0) -> list:
         """
-        theta_pick_raw: 掴む位置のID1目標値 (フォロワー値: 0-4095)
-        theta_place_raw: 置く位置のID1目標値 (フォロワー値: 0-4095)
-        
-        リーダー生値 ➔ フォロワー目標値への kinematics 変換を行い、
-        ID1 のみ指定角度へ滑らかに差し替えたフレーム配列を返します。
-        """
-        home_positions = {sid: JOINT_CONFIG[sid]["init"] for sid in SERVO_IDS}
-        prev_leader_cache = {}
-        follower_current_cache = dict(home_positions)
+        theta_pick_rad: 掴む位置の台座旋回角 [rad] (正面 0, 右 +, 左 -)
+        theta_place_rad: 置く位置の台座旋回角 [rad]
+        theta_home_rad: 初期姿勢の旋回角 (通常 0.0 rad)
 
+        ID 1 以外の関節角度はテンプレートの滑らかな昇降・把持軌道を維持し、
+        ID 1 のみ指定された角度へ S 字補間で差し替えたフレーム配列を返します。
+        """
         new_frames = []
         total_frames = len(self.template_frames)
 
-        for idx, (t, raw_pos) in enumerate(self.template_frames):
-            # 1. まず全軸をリーダー生値 ➔ フォロワー目標値へ座標変換
-            converted_pos = {}
-            for sid in SERVO_IDS:
-                raw_val = raw_pos[sid]
-                val = calculate_target(sid, raw_val, prev_leader_cache, follower_current_cache)
-                prev_leader_cache[sid] = raw_val
-                follower_current_cache[sid] = val
-                converted_pos[sid] = val
+        # 動的境界調整 (テンプレート長が異なる場合の安全クリップ)
+        f_rot_start = min(FRAME_ROTATE_START, int(total_frames * 0.50))
+        f_rot_end   = min(FRAME_ROTATE_END, int(total_frames * 0.65))
+        f_place_end = min(FRAME_PLACE_END, int(total_frames * 0.75))
 
-            # 2. ID1（旋回軸）の目標値を指定パラメータで動的に書き換え
-            if idx < FRAME_ROTATE_START:
+        for idx, (t, rad_pos) in enumerate(self.template_frames):
+            frame_pos = dict(rad_pos)
+
+            # ID 1（旋回軸）の目標値を指定パラメータで動的に書き換え
+            if idx < f_rot_start:
                 # Phase 1: 掴み〜持ち上げまでは theta_pick
-                converted_pos[1] = theta_pick_raw
+                frame_pos[1] = theta_pick_rad
 
-            elif FRAME_ROTATE_START <= idx <= FRAME_ROTATE_END:
-                # Phase 2: 旋回区間（コサインS字補間）
-                ratio_linear = (idx - FRAME_ROTATE_START) / max(1, (FRAME_ROTATE_END - FRAME_ROTATE_START))
+            elif f_rot_start <= idx <= f_rot_end:
+                # Phase 2: 旋回区間（コサイン S 字補間）
+                ratio_linear = (idx - f_rot_start) / max(1, (f_rot_end - f_rot_start))
                 s_ratio = (1.0 - math.cos(ratio_linear * math.pi)) / 2.0
-                converted_pos[1] = int(theta_pick_raw + s_ratio * (theta_place_raw - theta_pick_raw))
+                frame_pos[1] = theta_pick_rad + s_ratio * (theta_place_rad - theta_pick_rad)
 
-            elif FRAME_ROTATE_END < idx <= FRAME_PLACE_END:
+            elif f_rot_end < idx <= f_place_end:
                 # Phase 3: 下降〜離し完了までは theta_place
-                converted_pos[1] = theta_place_raw
+                frame_pos[1] = theta_place_rad
 
             else:
-                # Phase 4: Home復帰区間
-                ratio_linear = (idx - FRAME_PLACE_END) / max(1, (total_frames - 1 - FRAME_PLACE_END))
+                # Phase 4: Home 復帰区間
+                ratio_linear = (idx - f_place_end) / max(1, (total_frames - 1 - f_place_end))
                 s_ratio = (1.0 - math.cos(ratio_linear * math.pi)) / 2.0
-                converted_pos[1] = int(theta_place_raw + s_ratio * (theta_home_raw - theta_place_raw))
+                frame_pos[1] = theta_place_rad + s_ratio * (theta_home_rad - theta_place_rad)
 
-            new_frames.append((t, converted_pos))
+            new_frames.append((t, frame_pos))
 
         return new_frames
-
-
-# ==============================================================================
-# 単体テスト ＆ 3Dシミュレータ動作確認
-# ==============================================================================
-if __name__ == "__main__":
-    from core.sim_viewer import MujocoSimViewer
-    from config.joint_config import JOINT_CONFIG
-    import time
-
-    template_file = "motion_20260825_222909.csv"
-    generator = ParametricMotionGenerator(template_file)
-
-    # 🎯 正面（中央）で掴んで、別の指定角度へ置くテスト
-    pick_center = JOINT_CONFIG[1]["init"]  # 正面 (2048)
-    place_left  = 2600                    # 左前方
-
-    generated_frames = generator.generate(theta_pick_raw=pick_center, theta_place_raw=place_left)
-    print(f"✅ モーション生成完了: 全 {len(generated_frames)} フレーム")
-
-    print("\n🖥️ MuJoCo 3Dシミュレータでプレビュー再生を開始します...")
-    try:
-        sim = MujocoSimViewer()
-        with sim.launch():
-            start_time = time.time()
-            for t_target, pos_dict in generated_frames:
-                if not sim.is_running():
-                    break
-                while (time.time() - start_time) < t_target:
-                    time.sleep(0.001)
-                sim.update_joints(pos_dict)
-        print("✅ プレビュー再生が終了しました。")
-    except Exception as e:
-        print(f"⚠️ プレビューエラー: {e}")
