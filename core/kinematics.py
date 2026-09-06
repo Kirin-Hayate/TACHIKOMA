@@ -77,7 +77,7 @@ def radian_to_raw(sid: int, angle_rad: float) -> int:
 
 
 # 標準姿勢のラジアン定数定義
-WRIST_ROLL_HORIZONTAL_RAD = math.pi / 2.0  # 手首ロール横挟み (90°)
+WRIST_ROLL_HORIZONTAL_RAD = raw_to_radian(5, 2000)  # 約 -1.61 rad (-92.3°) # 手首ロール横挟み (90°)
 GRIPPER_OPEN_RAD = raw_to_radian(6, JOINT_CONFIG[6].get("f_max", 2600))
 GRIPPER_CLOSE_RAD = raw_to_radian(6, JOINT_CONFIG[6].get("f_min", 1400))
 
