@@ -4,7 +4,7 @@ MuJoCo 3Dシミュレーションビューア管理モジュール (core/sim_vie
 ==============================================================================
 【役割】
 1. SO-ARM100 の 3D モデル (assets/so100_scene.xml) を読み込んで画面に表示する
-2. 与えられた関節目標値 (Raw: 0〜4095) をラジアンに変換して 3D モデルの姿勢をリアルタイム更新する
+2. 与えられた関節角度（ラジアンまたはRaw値）を 3D モデルの姿勢にリアルタイム反映する
 3. キーボード操作（Space: 一時停止/再開, R: 最初から, L: ループ再生）の状態を管理する
 ==============================================================================
 """
@@ -36,17 +36,17 @@ class MujocoSimViewer:
         self.paused = False
         self.reset_requested = False
         self.loop_mode = False
-        self.playback_speed = 1.0  # ★ 再生速度倍率 (デフォルト: 1.0倍)
+        self.playback_speed = 1.0  # 再生速度倍率
 
         self.viewer = None
 
     def _key_callback(self, keycode):
         """
-        - Space (32)      : 一時停止 / 再開
-        - R (82, 114)     : 最初からリプレイ
-        - L (76, 108)     : ループ再生 ON / OFF
-        - 1〜9 (49〜57)   : 再生速度倍率の変更 (1倍〜9倍速)
-        - テンキー 1〜9 (321〜329) : テンキー倍率変更
+        - Space (32)               : 一時停止 / 再開
+        - R (82, 114)              : 最初からリプレイ
+        - L (76, 108)              : ループ再生 ON / OFF
+        - 1〜9 (49〜57)            : 再生速度倍率の変更 (1倍〜9倍速)
+        - テンキー 1〜9 (321〜329)  : テンキー倍率変更
         """
         if keycode == 32:  # Space
             self.paused = not self.paused
@@ -68,7 +68,18 @@ class MujocoSimViewer:
             self.playback_speed = speed
             print(f"\n⏩ 再生速度: {speed:.1f}倍速")
 
+    def update_joints_rad(self, target_radians):
+        """物理ラジアン辞書 {1: q1, ..., 6: q6} を直接 MuJoCo に適用"""
+        for i, sid in enumerate(SERVO_IDS):
+            if sid in target_radians and i < self.model.nq:
+                self.data.qpos[i] = target_radians[sid]
+
+        mujoco.mj_forward(self.model, self.data)
+        if self.viewer is not None:
+            self.viewer.sync()
+
     def update_joints(self, target_positions):
+        """旧形式: フォロワー Raw 値 (0-4095) 辞書をラジアンに変換して適用"""
         for i, sid in enumerate(SERVO_IDS):
             if sid in target_positions:
                 target_val = target_positions[sid]
