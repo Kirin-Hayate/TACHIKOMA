@@ -232,7 +232,12 @@ def main():
             for idx, task in enumerate(tasks, start=1):
                 p = task['pick']
                 d = task['place']
-                print(f"   {idx}. {task.get('description', '')} (Pick: r={p['r']*100:.0f}cm, θ={p['theta_deg']:+.0f}° ➔ Place: r={d['r']*100:.0f}cm, θ={d['theta_deg']:+.0f}°)")
+                # z を mm 単位に変換して追記
+                print(
+                    f"   {idx}. {task.get('description', '')}\n"
+                    f"      Pick : r={p['r']*100:4.1f}cm, θ={p['theta_deg']:+5.1f}°, z={p['z']*1000:4.1f}mm\n"
+                    f"      Place: r={d['r']*100:4.1f}cm, θ={d['theta_deg']:+5.1f}°, z={d['z']*1000:4.1f}mm"
+                )
 
             # --- 1. 3D シミュレータプレビュー ---
             print("\n🖥️ 3Dシミュレータでプレビューを再生します...")
