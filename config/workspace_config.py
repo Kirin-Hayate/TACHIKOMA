@@ -51,5 +51,6 @@ DISTANCE_PRESETS = {
 R_MIN_METERS = 0.10
 R_MAX_METERS = 0.45
 
-# 机面接触・自重たわみ補正後のデフォルト爪高さ [m] (45mm)
-DEFAULT_Z_TCP = 0.055
+# 机面を 0 としたときの、本来把持・設置したい物理的な爪高さ [m]
+# たわみは kinematics 側で自動補正されるため、純粋な把持オフセット (例: 5mm) を指定
+DEFAULT_Z_TCP = 0.005  # 5mm

@@ -36,7 +36,7 @@ class MujocoSimViewer:
         self.paused = False
         self.reset_requested = False
         self.loop_mode = False
-        self.playback_speed = 1.0  # 再生速度倍率
+        self.playback_speed = 9.0  # 再生速度倍率
 
         self.viewer = None
 
