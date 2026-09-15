@@ -1,0 +1,13 @@
+{
+  "markers": {
+    "0": { "r_cm": 60.0, "theta_deg": -20.0, "description": "奥・左" },
+    "1": { "r_cm": 60.0, "theta_deg":  20.0, "description": "奥・右" },
+    "2": { "r_cm": 27.0, "theta_deg": -60.0, "description": "手前・左" },
+    "3": { "r_cm": 26.0, "theta_deg":  62.0, "description": "手前・右" }
+  },
+  "warp_settings": {
+    "output_width_px": 600,
+    "output_height_px": 600,
+    "pixels_per_mm": 1.0
+  }
+}
