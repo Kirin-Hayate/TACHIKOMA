@@ -45,7 +45,7 @@ CANVAS_SIZE = 500
 MARGIN = 50
 INNER_SPAN_PX = 400
 
-# Pick / Place における目標高さ [mm]（デフォルト15mm）
+# Pick / Place における目標高さ [mm]
 DEFAULT_Z_MM = 15.0
 LIFT_Z_MM = 80.0  # 持ち上げ時・移動時の上空高さ [mm]
 
@@ -69,6 +69,38 @@ def smooth_move_rad(follower, sim, target_rad, current_rad, duration=1.2, steps=
                 pass
         time.sleep(interval)
     current_rad.update(target_rad)
+
+
+def move_to_home_and_wait(follower, sim, home_rad, current_rad, timeout=4.0):
+    """手首(ID4)を先行して引き起こし、確実に全サーボが Home 姿勢に到達・静止するまで待機"""
+    print("🏠 Home 姿勢へ安全復帰中...")
+
+    # ステップ1: ID4 (手首ピッチ) を先行して初期姿勢へ引き上げる (干渉・脱落防止)
+    intermediate_rad = dict(current_rad)
+    intermediate_rad[4] = home_rad[4]
+    smooth_move_rad(follower, sim, intermediate_rad, current_rad, duration=1.0, steps=20)
+
+    # ステップ2: 全軸を Home 姿勢へ補間移動
+    smooth_move_rad(follower, sim, home_rad, current_rad, duration=2.0, steps=35)
+
+    # ステップ3: 実機サーボの物理到達を監視
+    if follower is not None:
+        start_t = time.time()
+        while time.time() - start_t < timeout:
+            all_reached = True
+            for sid in [1, 2, 3, 4]:
+                pos = follower.read_position(sid)
+                if pos is not None:
+                    cur_angle = raw_to_radian(sid, pos)
+                    threshold = 0.15 if sid == 4 else 0.08
+                    if abs(cur_angle - home_rad[sid]) > threshold:
+                        all_reached = False
+                        break
+            if all_reached:
+                break
+            time.sleep(0.05)
+        time.sleep(0.3)
+    print("✅ Home 姿勢への復帰が完了しました。")
 
 
 def pixel_to_robot_polar(u: float, v: float, projector: VisionProjector) -> Tuple[float, float, float, float]:
@@ -96,7 +128,6 @@ def pixel_to_robot_polar(u: float, v: float, projector: VisionProjector) -> Tupl
     return x_mm, y_mm, r_cm, th_deg
 
 
-# クリック管理
 click_buffer = []
 
 def on_mouse_click(event, x, y, flags, param):
@@ -106,7 +137,6 @@ def on_mouse_click(event, x, y, flags, param):
 
 
 def compute_target_poses(r_cm, th_deg, z_mm, gripper_rad):
-    """指定された位置・高さ・グリッパー開閉のIKを計算して返す"""
     tgt_rad, wp_rad, pitch = solve_ik_adaptive_approach(
         r_tcp=(r_cm / 100.0),
         theta_deg=th_deg,
@@ -123,7 +153,7 @@ def main():
     print(" 🤖 ビジョンベース Pick & Place ツール")
     print("==================================================")
 
-    # 1. ハードウェア & シミュレータ初期化
+    # 1. 実機・シミュレータ初期化
     follower = None
     try:
         follower = STS3215Driver(FOLLOWER_PORT, baudrate=BAUDRATE, timeout=0.01)
@@ -136,7 +166,7 @@ def main():
         sim = MujocoSimViewer()
         print("✅ 3Dシミュレータ初期化完了")
     except Exception as e:
-        print(f"⚠️ 3Dシミュレータ初期化失敗: {e}")
+        print(f"⚠️ 3Dシミュレータ初期化スキップ: {e}")
 
     home_rad = get_home_radians()
     current_rad = dict(home_rad)
@@ -163,26 +193,35 @@ def main():
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
 
-    print("⏳ カメラからマーカーを検出中...")
-    for _ in range(30):
+    # アームをまず Home 姿勢へ移動させてマーカーの視界をクリアにする
+    move_to_home_and_wait(follower, sim, home_rad, current_rad)
+
+    # マーカー認識と初期ホモグラフィ構築
+    print("⏳ カメラから4隅マーカーを探索・初期化中...")
+    calibrated = False
+    for _ in range(40):
         ret, frame = cap.read()
         if ret and projector.update_homography(frame):
+            calibrated = True
+            print("✅ 4隅マーカーを検出し、ホモグラフィ行列を固定しました。")
             break
         time.sleep(0.05)
 
-    print("🏠 Home 姿勢へ移動します...")
-    smooth_move_rad(follower, sim, home_rad, current_rad, duration=1.5)
+    if not calibrated:
+        print("⚠️ 起動時に4枚すべてのマーカーを検出できませんでした。")
+        print("   画角を確認し、4枚がカメラに見える状態で [SPACE] を押してください。")
 
     cv2.namedWindow("Pick & Place Planner")
     cv2.setMouseCallback("Pick & Place Planner", on_mouse_click)
+    cv2.namedWindow("Raw Camera Preview")
 
     pick_pt = None
     place_pt = None
 
     print("\n👉 【操作手順】")
-    print("   1. 正射影ウィンドウ上でまず **[Pick 地点]** をクリック")
+    print("   1. [Pick & Place Planner] 画面でまず **[Pick 地点]** をクリック")
     print("   2. 次に **[Place 地点]** をクリック")
-    print("   3. シミュレーションプレビュー後、ターミナルで実行承認を行う")
+    print("   3. ターミナルで 'y' を入力して実行")
 
     try:
         while True:
@@ -190,10 +229,14 @@ def main():
             if not ret:
                 break
 
-            warped = projector.warp_to_topdown(frame, out_w=CANVAS_SIZE, out_h=CANVAS_SIZE)
+            # 一度キャリブレーションできていれば、その行列を用いて安定ワーピング
+            warped = None
+            if projector.homography_mat is not None:
+                warped = cv2.warpPerspective(frame, projector.homography_mat, (CANVAS_SIZE, CANVAS_SIZE))
+
             display_img = warped.copy() if warped is not None else np.zeros((CANVAS_SIZE, CANVAS_SIZE, 3), dtype=np.uint8)
 
-            # グリッド描画
+            # ガイドグリッド描画
             for p in range(MARGIN, CANVAS_SIZE - MARGIN + 1, 100):
                 cv2.line(display_img, (p, MARGIN), (p, CANVAS_SIZE - MARGIN), (255, 200, 0), 1)
                 cv2.line(display_img, (MARGIN, p), (CANVAS_SIZE - MARGIN, p), (255, 200, 0), 1)
@@ -206,36 +249,59 @@ def main():
                 cv2.drawMarker(display_img, place_pt, (255, 0, 0), cv2.MARKER_CROSS, 20, 2)
                 cv2.putText(display_img, "PLACE", (place_pt[0]+10, place_pt[1]-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
 
-            # ガイドメッセージ
-            msg = "1. Click PICK point" if pick_pt is None else ("2. Click PLACE point" if place_pt is None else "Ready! Check Terminal.")
-            cv2.putText(display_img, msg, (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2, cv2.LINE_AA)
+            # 状態メッセージ
+            if warped is None:
+                msg = "Press [SPACE] to Calibrate 4 Markers"
+                status_color = (0, 0, 255)
+            elif pick_pt is None:
+                msg = "1. Click PICK point"
+                status_color = (0, 255, 0)
+            elif place_pt is None:
+                msg = "2. Click PLACE point"
+                status_color = (0, 255, 255)
+            else:
+                msg = "Ready! Check Terminal."
+                status_color = (255, 200, 0)
 
+            cv2.putText(display_img, msg, (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, status_color, 2, cv2.LINE_AA)
             cv2.imshow("Pick & Place Planner", display_img)
+
+            # 生カメラプレビュー（マーカー認識状態を可視化）
+            raw_preview = cv2.resize(frame, (480, 270))
+            detected_centers = projector.detect_markers(frame)
+            for mid, pt in detected_centers.items():
+                cx, cy = int(pt[0] * 480 / 1280), int(pt[1] * 270 / 720)
+                cv2.circle(raw_preview, (cx, cy), 4, (0, 255, 0), -1)
+                cv2.putText(raw_preview, f"ID{mid}", (cx - 15, cy - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
+
+            det_status = " | ".join([f"ID{i}:{'OK' if i in detected_centers else '--'}" for i in range(4)])
+            cv2.putText(raw_preview, det_status, (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+            cv2.imshow("Raw Camera Preview", raw_preview)
 
             # --- クリック処理 ---
             if len(click_buffer) > 0:
                 pt = click_buffer.pop(0)
+                if warped is None:
+                    print("⚠️ マーカー認識が未完了です。[SPACE] を押してキャリブレーションを行ってください。")
+                    continue
+
                 if pick_pt is None:
                     pick_pt = pt
                     print(f"📍 Pick 地点決定: Pixel={pick_pt}")
                 elif place_pt is None:
                     place_pt = pt
                     print(f"📍 Place 地点決定: Pixel={place_pt}")
-                    time.sleep(0.5)
-                    # --- 両方の地点が揃ったのでシーケンスを生成・プレビュー・実行 ---
-                    print("\n--- 軌道生成・シミュレーション検証を開始 ---")
-                    
-                    # 座標変換
+                    time.sleep(0.3)
+
+                    print("\n--- 軌道生成・IK検証を開始 ---")
                     _, _, pick_r, pick_th = pixel_to_robot_polar(pick_pt[0], pick_pt[1], projector)
                     _, _, place_r, place_th = pixel_to_robot_polar(place_pt[0], place_pt[1], projector)
 
-                    # 1. Pick姿勢の計算
                     _, pick_wp, _ = compute_target_poses(pick_r, pick_th, LIFT_Z_MM, GRIPPER_OPEN_RAD)
                     pick_target, _, _ = compute_target_poses(pick_r, pick_th, DEFAULT_Z_MM, GRIPPER_OPEN_RAD)
                     pick_grasp, _, _ = compute_target_poses(pick_r, pick_th, DEFAULT_Z_MM, GRIPPER_CLOSE_RAD)
                     _, pick_lift, _ = compute_target_poses(pick_r, pick_th, LIFT_Z_MM, GRIPPER_CLOSE_RAD)
 
-                    # 2. Place姿勢の計算
                     _, place_wp, _ = compute_target_poses(place_r, place_th, LIFT_Z_MM, GRIPPER_CLOSE_RAD)
                     place_target, _, _ = compute_target_poses(place_r, place_th, DEFAULT_Z_MM, GRIPPER_CLOSE_RAD)
                     place_release, _, _ = compute_target_poses(place_r, place_th, DEFAULT_Z_MM, GRIPPER_OPEN_RAD)
@@ -245,29 +311,6 @@ def main():
                         print("❌ [IK解なし] 指定されたPickまたはPlace地点は可動範囲外です。リセットします。")
                         pick_pt, place_pt = None, None
                         continue
-
-                    # シミュレーションでプレビュー再生
-                    """
-                    print("🖥️ MuJoCo シミュレータでプレビューを再生します...")
-                    if sim is not None:
-                        sim_rad = dict(current_rad)
-                        try:
-                            steps_sim = 20
-                            for target in [pick_wp, pick_target, pick_grasp, pick_lift, place_wp, place_target, place_release, place_retreat]:
-                                if target is None:
-                                    continue
-                                for step in range(1, steps_sim + 1):
-                                    ratio = step / steps_sim
-                                    temp_rad = {sid: sim_rad.get(sid, 0.0) + ratio * (target.get(sid, 0.0) - sim_rad.get(sid, 0.0)) for sid in SERVO_IDS}
-                                    try:
-                                        sim.update_joints_rad(temp_rad)
-                                    except Exception:
-                                        pass
-                                    time.sleep(0.01)
-                                sim_rad.update(target)
-                        except Exception as e:
-                            print(f"⚠️ シミュレーションプレビュー中エラー: {e}")
-                    """
 
                     # ユーザー承認
                     ans = input("\n🤔 この動作を実機で実行しますか？ [y/N]: ").strip().lower()
@@ -288,32 +331,37 @@ def main():
                     else:
                         print("🛑 実機実行はキャンセルされました。")
 
+                    # Home 姿勢へ退避して次へ
+                    move_to_home_and_wait(follower, sim, home_rad, current_rad)
                     pick_pt, place_pt = None, None
                     print("\n👉 次の Pick 地点を選択してください（または [Q] で終了）。")
 
             key = cv2.waitKey(1) & 0xFF
             if key in [ord('q'), ord('Q'), 27]:
                 break
-            elif key == 32:
+            elif key == 32:  # SPACE: 強制再キャリブレーション
                 if projector.update_homography(frame):
-                    print("🔄 キャリブレーションを再計算しました。")
+                    print("🔄 キャリブレーションを最新フレームで更新・固定しました。")
+                else:
+                    print("⚠️ 4枚のマーカーが全て見えていません。画角を確認してください。")
             elif key in [ord('h'), ord('H')]:
-                print("🏠 Home 姿勢へ退避します...")
-                smooth_move_rad(follower, sim, home_rad, current_rad, duration=1.5)
+                move_to_home_and_wait(follower, sim, home_rad, current_rad)
                 pick_pt, place_pt = None, None
 
     except KeyboardInterrupt:
         pass
     finally:
-        print("\n🏠 終了処理...")
         try:
-            smooth_move_rad(follower, sim, home_rad, current_rad, duration=1.5)
+            move_to_home_and_wait(follower, sim, home_rad, current_rad)
         except Exception:
             pass
+
         if follower is not None:
             for sid in SERVO_IDS:
                 follower.set_torque(sid, False)
             follower.close()
+            print("✅ 全サーボのトルクを OFF にし、ポートを閉じました。")
+
         cap.release()
         cv2.destroyAllWindows()
 
