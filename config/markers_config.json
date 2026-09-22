@@ -1,9 +1,25 @@
 {
   "markers": {
-    "0": { "r_cm": 60.0, "theta_deg": -20.0, "description": "奥・左" },
-    "1": { "r_cm": 60.0, "theta_deg":  20.0, "description": "奥・右" },
-    "2": { "r_cm": 27.0, "theta_deg": -60.0, "description": "手前・左" },
-    "3": { "r_cm": 26.0, "theta_deg":  62.0, "description": "手前・右" }
+    "0": {
+      "r_cm": 61.27,
+      "theta_deg": -29.19,
+      "description": "奥・左"
+    },
+    "1": {
+      "r_cm": 56.69,
+      "theta_deg": 16.0,
+      "description": "奥・右"
+    },
+    "2": {
+      "r_cm": 31.99,
+      "theta_deg": -65.04,
+      "description": "手前・左"
+    },
+    "3": {
+      "r_cm": 21.97,
+      "theta_deg": 48.69,
+      "description": "手前・右"
+    }
   },
   "warp_settings": {
     "output_width_px": 600,
