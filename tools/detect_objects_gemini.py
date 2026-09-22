@@ -1,12 +1,13 @@
 """
 ==============================================================================
-Gemini 2.5 Flash 物体検出・高速グラウンディングツール (tools/detect_objects_gemini.py)
+Gemini 高速物体検出・グラウンディング実験ツール (tools/detect_objects_gemini.py)
 ==============================================================================
 【役割】
-1. 机面正射影画像 (topdown_warped.jpg またはカメラ映像) を取得。
-2. Google GenAI SDK 経由で Gemini 2.5 Flash に画像を送信。
-3. 厳密な JSON スキーマにより、机上の物体名と [ymin, xmin, ymax, xmax] (0〜1000) を即時抽出。
-4. 正射影画像上にミリ精度でバウンディングボックスと中心点を重畳描画して確認。
+1. プログラム起動時に毎回 Web カメラから最新フレームを自動取得。
+2. 4隅の ArUco マーカーを認識して机面の真上正射影画像 (500x500) を生成。
+3. Gemini Flash に画像を送信し、検出された把持対象物体の BBox [ymin, xmin, ymax, xmax] を取得。
+4. 正射影画像上に BBox と把持中心点を重畳表示。
+5. [SPACE] を押すたびに何度でも最新の配置を再撮影・再検出可能。
 ==============================================================================
 """
 
@@ -18,27 +19,13 @@ import cv2
 import numpy as np
 from PIL import Image
 from pydantic import BaseModel, Field
-from typing import List
+from typing import List , Optional
+from dotenv import load_dotenv
 
-import sys
-import os
-import time
-import json
-from dotenv import load_dotenv  # 👈 追加
-
-# プロジェクトルートにある .env を明示的にロード
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ENV_PATH = os.path.join(BASE_DIR, ".env")
-load_dotenv(dotenv_path=ENV_PATH)  # 👈 追加（.env を読み込んで os.environ に展開）
+load_dotenv(dotenv_path=ENV_PATH)
 
-if BASE_DIR not in sys.path:
-    sys.path.append(BASE_DIR)
-
-# Google GenAI SDK
-from google import genai
-from google.genai import types
-
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if BASE_DIR not in sys.path:
     sys.path.append(BASE_DIR)
 
@@ -48,14 +35,18 @@ from core.vision_projector import VisionProjector
 from google import genai
 from google.genai import types
 
-# 入力画像パス設定
+# 保存ディレクトリ
 CAPTURE_DIR = os.path.join(BASE_DIR, "data", "camera_captures")
 os.makedirs(CAPTURE_DIR, exist_ok=True)
 WARPED_IMAGE_PATH = os.path.join(CAPTURE_DIR, "topdown_warped.jpg")
+RESULT_IMAGE_PATH = os.path.join(CAPTURE_DIR, "gemini_detected_result.jpg")
+
+# 使用モデル
+MODEL_ID = "gemini-3.6-flash"
 
 
 # ==============================================================================
-# 1. 出力フォーマットのスキーマ定義 (Pydantic による完全型拘束)
+# 1. Pydantic スキーマ定義
 # ==============================================================================
 class BoundingBox2D(BaseModel):
     name: str = Field(description="物体の名称 (例: wooden block, jenga, scissors, pen, mouse)")
@@ -68,10 +59,10 @@ class TabletopDetections(BaseModel):
 
 
 # ==============================================================================
-# 2. Gemini 2.5 Flash API への問い合わせ
+# 2. Gemini API 問い合わせ
 # ==============================================================================
 def query_gemini_vision(image_bgr: np.ndarray) -> List[dict]:
-    """Gemini 3.6 Flash を呼び出して机上物体の BBox 一覧を取得"""
+    """Gemini を呼び出して机上物体の BBox 一覧を取得"""
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
         print(f"❌ '{ENV_PATH}' または環境変数内に 'GEMINI_API_KEY' が見つかりませんでした。")
@@ -79,7 +70,6 @@ def query_gemini_vision(image_bgr: np.ndarray) -> List[dict]:
 
     client = genai.Client(api_key=api_key)
 
-    # OpenCV (BGR) から PIL Image (RGB) へ変換
     img_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
     pil_image = Image.fromarray(img_rgb)
 
@@ -90,12 +80,12 @@ def query_gemini_vision(image_bgr: np.ndarray) -> List[dict]:
         "Return the tight 2D bounding boxes using normalized coordinates [ymin, xmin, ymax, xmax] scaled to [0, 1000]."
     )
 
-    print("⚡ gemini-3.6-flash へ推論リクエスト中...")
+    print(f"⚡ {MODEL_ID} へ推論リクエスト中...")
     start_time = time.time()
 
     try:
         response = client.models.generate_content(
-            model="gemini-3.6-flash",
+            model=MODEL_ID,
             contents=[pil_image, prompt],
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
@@ -115,7 +105,7 @@ def query_gemini_vision(image_bgr: np.ndarray) -> List[dict]:
 
 
 # ==============================================================================
-# 3. 検出結果の可視化と中心座標の計算
+# 3. 検出結果の可視化
 # ==============================================================================
 def draw_detections(image_bgr: np.ndarray, detected_objects: List[dict]) -> np.ndarray:
     """正射影画像上に BBox と中心ピクセル座標を描画"""
@@ -123,6 +113,9 @@ def draw_detections(image_bgr: np.ndarray, detected_objects: List[dict]) -> np.n
     h, w = annotated.shape[:2]
 
     print("\n🔍 === 検出された物体一覧 ===")
+    if not detected_objects:
+        print("  (把持可能な物体は見つかりませんでした)")
+
     for i, obj in enumerate(detected_objects):
         name = obj.get("name", f"object_{i}")
         box = obj.get("box_2d", [])
@@ -131,25 +124,19 @@ def draw_detections(image_bgr: np.ndarray, detected_objects: List[dict]) -> np.n
 
         ymin, xmin, ymax, xmax = box
 
-        # 0〜1000 の正規化座標を実ピクセル座標に変換
         px_ymin = int((ymin / 1000.0) * h)
         px_xmin = int((xmin / 1000.0) * w)
         px_ymax = int((ymax / 1000.0) * h)
         px_xmax = int((xmax / 1000.0) * w)
 
-        # 中心ピクセル (u, v)
         center_u = int((px_xmin + px_xmax) / 2)
         center_v = int((px_ymin + px_ymax) / 2)
 
         print(f"  [{i+1}] {name:<14} | BBox: ({px_xmin}, {px_ymin}) -> ({px_xmax}, {px_ymax}) | 中心: ({center_u}, {center_v}) px")
 
-        # バウンディングボックス (緑色)
         cv2.rectangle(annotated, (px_xmin, px_ymin), (px_xmax, px_ymax), (0, 255, 0), 2)
-
-        # 把持目標中心点 (赤丸)
         cv2.circle(annotated, (center_u, center_v), 5, (0, 0, 255), -1)
 
-        # ラベル描画（黒アウトライン＋黄色前景文字）
         label = f"{name}"
         cv2.putText(annotated, label, (px_xmin, max(20, px_ymin - 8)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 3, cv2.LINE_AA)
@@ -159,66 +146,80 @@ def draw_detections(image_bgr: np.ndarray, detected_objects: List[dict]) -> np.n
     return annotated
 
 
+def capture_topdown_frame(cap, projector, max_attempts=30) -> Optional[np.ndarray]:
+    """カメラから最新フレームを読み取り、正射影画像を生成する"""
+    print("📷 カメラから最新フレームを取得中...")
+    warped = None
+    for _ in range(max_attempts):
+        ret, frame = cap.read()
+        if not ret:
+            time.sleep(0.05)
+            continue
+        if projector.update_homography(frame):
+            warped = projector.warp_to_topdown(frame, out_w=500, out_h=500)
+            break
+        time.sleep(0.05)
+    return warped
+
+
 # ==============================================================================
-# メイン処理
+# メインループ
 # ==============================================================================
 def main():
     print("==================================================")
-    print(" 🚀 Gemini 2.5 Flash 机上物体高速グラウンディング")
+    print(" 🚀 Gemini 机上物体高速グラウンディング実験")
     print("==================================================")
+    print("【操作】")
+    print("  - [SPACE] : 最新のカメラ映像で再検出")
+    print("  - [Q] / [ESC] : 終了")
+    print("--------------------------------------------------")
 
-    target_img = None
+    projector = VisionProjector()
+    cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+    if not cap.isOpened():
+        cap = cv2.VideoCapture(0)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
 
-    # 保存済みの正射影画像が存在すれば優先使用
-    if os.path.exists(WARPED_IMAGE_PATH):
-        print(f"📁 保存済みの正射影画像をロード: {WARPED_IMAGE_PATH}")
-        target_img = cv2.imread(WARPED_IMAGE_PATH)
-
-    # 保存画像がない場合はカメラから動的生成
-    if target_img is None:
-        print("📷 カメラから正射影画像を生成中...")
-        projector = VisionProjector()
-        cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
-        if not cap.isOpened():
-            cap = cv2.VideoCapture(0)
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-
-        for _ in range(30):
-            ret, frame = cap.read()
-            if ret and projector.update_homography(frame):
-                target_img = projector.warp_to_topdown(frame, out_w=500, out_h=500)
-                break
-            time.sleep(0.05)
-
-        cap.release()
-
-        if target_img is not None:
-            cv2.imwrite(WARPED_IMAGE_PATH, target_img)
-            print(f"💾 正射影画像を保存しました: {WARPED_IMAGE_PATH}")
-        else:
+    # 初回検出の実行
+    def run_detection_pipeline():
+        target_img = capture_topdown_frame(cap, projector)
+        if target_img is None:
             print("❌ 正射影画像の生成に失敗しました（4隅マーカーを認識できませんでした）。")
-            return
+            return None
 
-    # Gemini 2.5 Flash による推論
-    detected_objects = query_gemini_vision(target_img)
-    if not detected_objects:
-        print("⚠️ 物体が検出されませんでした。")
-        return
+        cv2.imwrite(WARPED_IMAGE_PATH, target_img)
 
-    # 結果の可視化
-    result_img = draw_detections(target_img, detected_objects)
+        detected = query_gemini_vision(target_img)
+        result_img = draw_detections(target_img, detected)
+        cv2.imwrite(RESULT_IMAGE_PATH, result_img)
+        return result_img
 
-    # 画像保存
-    out_path = os.path.join(CAPTURE_DIR, "gemini_detected_result.jpg")
-    cv2.imwrite(out_path, result_img)
-    print(f"\n💾 結果画像を保存しました: {out_path}")
+    current_result = run_detection_pipeline()
 
-    # ウィンドウ表示
-    cv2.imshow("Gemini 2.5 Flash Object Detection", result_img)
-    print("👉 ウィンドウをクリックして任意のキーを押すと終了します。")
-    cv2.waitKey(0)
-    cv2.destroyAllWindows()
+    try:
+        while True:
+            if current_result is not None:
+                cv2.imshow("Gemini Tabletop Object Detection", current_result)
+            else:
+                # 取得失敗時はブランク画面に案内
+                blank = np.zeros((500, 500, 3), dtype=np.uint8)
+                cv2.putText(blank, "Marker detection failed.", (50, 240),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                cv2.putText(blank, "Check markers and press SPACE", (50, 280),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+                cv2.imshow("Gemini Tabletop Object Detection", blank)
+
+            key = cv2.waitKey(30) & 0xFF
+            if key in [ord('q'), ord('Q'), 27]:
+                break
+            elif key == 32:  # SPACE
+                print("\n🔄 新しい配置を再撮影・再検出します...")
+                current_result = run_detection_pipeline()
+
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":
