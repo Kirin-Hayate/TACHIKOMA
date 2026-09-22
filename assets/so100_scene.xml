@@ -2,25 +2,21 @@
   <compiler angle="radian" meshdir="assets" autolimits="true"/>
 
   <visual>
-    <!-- 目に優しい落ち着いたライティング -->
     <headlight ambient="0.45 0.45 0.45" diffuse="0.6 0.6 0.6" specular="0.1 0.1 0.1"/>
-    <!-- 背景グラデーションと同調する霞色 -->
     <rgba haze="0.18 0.18 0.2 1"/>
     <global offwidth="1920" offheight="1080"/>
   </visual>
 
   <asset>
-    <!-- ダークグレー系の目に優しいスタジオ背景 -->
     <texture type="skybox" builtin="gradient" rgb1="0.25 0.26 0.28" rgb2="0.12 0.12 0.14" width="512" height="512"/>
-    <!-- シックなグリッド床面 -->
     <texture name="grid" type="2d" builtin="checker" width="512" height="512" rgb1="0.18 0.18 0.2" rgb2="0.22 0.22 0.24"/>
     <material name="grid_mat" texture="grid" texrepeat="10 10" reflectance="0.05"/>
 
-    <!-- マテリアルカラー定義 -->
     <material name="white_print" rgba="0.88 0.88 0.88 1.0" specular="0.3" shininess="0.3"/>
     <material name="servo_mat" rgba="0.18 0.38 0.75 1.0" specular="0.6" shininess="0.5"/>
+    <!-- ✅ 正しい位置 (<asset>内) -->
+    <material name="wood_mat" rgba="0.85 0.72 0.52 1.0" specular="0.1" shininess="0.1"/>
 
-    <!-- メッシュ定義一式（ファイル名と完全一致） -->
     <mesh name="base_mesh" file="Base.stl"/>
     <mesh name="base_motor_mesh" file="Base_Motor.stl"/>
     <mesh name="rot_pitch_mesh" file="Rotation_Pitch.stl"/>
@@ -85,6 +81,42 @@
           </body>
         </body>
       </body>
+    </body>
+
+    <!-- ================================================================= -->
+    <!-- デジタルツイン同期用: ジェンガブロック群 (最大8個)                 -->
+    <!-- ================================================================= -->
+    <body name="jenga_block_0" pos="0 0 -1">
+      <freejoint/>
+      <geom type="box" size="0.0375 0.0125 0.0075" material="wood_mat" mass="0.015"/>
+    </body>
+    <body name="jenga_block_1" pos="0 0 -1">
+      <freejoint/>
+      <geom type="box" size="0.0375 0.0125 0.0075" material="wood_mat" mass="0.015"/>
+    </body>
+    <body name="jenga_block_2" pos="0 0 -1">
+      <freejoint/>
+      <geom type="box" size="0.0375 0.0125 0.0075" material="wood_mat" mass="0.015"/>
+    </body>
+    <body name="jenga_block_3" pos="0 0 -1">
+      <freejoint/>
+      <geom type="box" size="0.0375 0.0125 0.0075" material="wood_mat" mass="0.015"/>
+    </body>
+    <body name="jenga_block_4" pos="0 0 -1">
+      <freejoint/>
+      <geom type="box" size="0.0375 0.0125 0.0075" material="wood_mat" mass="0.015"/>
+    </body>
+    <body name="jenga_block_5" pos="0 0 -1">
+      <freejoint/>
+      <geom type="box" size="0.0375 0.0125 0.0075" material="wood_mat" mass="0.015"/>
+    </body>
+    <body name="jenga_block_6" pos="0 0 -1">
+      <freejoint/>
+      <geom type="box" size="0.0375 0.0125 0.0075" material="wood_mat" mass="0.015"/>
+    </body>
+    <body name="jenga_block_7" pos="0 0 -1">
+      <freejoint/>
+      <geom type="box" size="0.0375 0.0125 0.0075" material="wood_mat" mass="0.015"/>
     </body>
   </worldbody>
 </mujoco>
