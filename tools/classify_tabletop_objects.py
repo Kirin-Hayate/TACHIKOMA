@@ -1,15 +1,16 @@
 """
 ==============================================================================
-ハイブリッド物体同定ツール (tools/classify_tabletop_objects.py)
+ハイブリッド物体同定ツール (tools/classify_tabletop_objects.py) - Qwen版
 ==============================================================================
 【役割】
-1. OpenCV の背景差分・輪郭抽出により、30fps で机上物体の位置・向きを即時特定。
+1. OpenCV の背景差分・輪郭抽出により、30fps で机上物体の位置・向き・輪郭を即時特定。
 2. 各物体領域のサムネイル画像を自動クロップ。
-3. [C] キー入力時に Gemini (gemini-3.6-flash) を呼び出し、各サムネイルが何であるかを分類同定。
-4. 物体ラベル（例: wooden block, mouse, pen など）を画面上に維持・表示。
+3. [C] キー入力時にローカル Ollama (qwen2.5vl:3b) を呼び出し、
+   「これは何（wooden block / mouse / pen 等）か？」を同定。
+4. クロップ画像のみを投げるため、軽量・低遅延かつ完全オフラインで動作可能。
 
 【操作】
-  - [C]     : 現在検出されている全物体を Gemini に投げて分類・同定
+  - [C]     : 現在検出されている物体を Qwen2.5-VL で分類・同定
   - [B]     : 現在の机面を背景として記憶（背景差分更新）
   - [SPACE] : 4隅マーカーから正射影を再計算
   - [Q/ESC] : 終了
@@ -19,26 +20,25 @@
 import sys
 import os
 import time
-import math
+import json
+import base64
+import re
+import urllib.request
+import urllib.error
 import cv2
 import numpy as np
-from PIL import Image
-from pydantic import BaseModel, Field
 from typing import List, Dict, Optional, Tuple
-from dotenv import load_dotenv
+import threading
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-ENV_PATH = os.path.join(BASE_DIR, ".env")
-load_dotenv(dotenv_path=ENV_PATH)
-
 if BASE_DIR not in sys.path:
     sys.path.append(BASE_DIR)
 
 from core.vision_projector import VisionProjector
 
-# Google GenAI SDK
-from google import genai
-from google.genai import types
+# Ollama 設定
+OLLAMA_API_URL = "http://localhost:11434/api/generate"
+MODEL_NAME = "qwen2.5vl:3b"
 
 # キャンバス設定
 CANVAS_SIZE = 500
@@ -48,75 +48,94 @@ INNER_SPAN_PX = 400
 MIN_AREA_PX = 600
 MAX_AREA_PX = 25000
 
-MODEL_ID = "gemini-3.6-flash"
+
+# ==============================================================================
+# 1. 画像 Base64 エンコード
+# ==============================================================================
+def encode_crop_to_base64(crop_bgr: np.ndarray, target_size: int = 128) -> str:
+    """切り出し画像を正方形パディング＆リサイズして Base64 化 (極小トークン化)"""
+    h, w = crop_bgr.shape[:2]
+    # アスペクト比を維持しつつ長辺を target_size に揃える
+    scale = target_size / max(h, w)
+    resized = cv2.resize(crop_bgr, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+
+    # 黒パディングで正方形にする
+    rh, rw = resized.shape[:2]
+    padded = np.zeros((target_size, target_size, 3), dtype=np.uint8)
+    y_off = (target_size - rh) // 2
+    x_off = (target_size - rw) // 2
+    padded[y_off:y_off + rh, x_off:x_off + rw] = resized
+
+    success, buffer = cv2.imencode(".jpg", padded, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+    if not success:
+        raise ValueError("JPEG エンコードに失敗しました。")
+    return base64.b64encode(buffer).decode("utf-8")
 
 
 # ==============================================================================
-# 1. Pydantic スキーマ定義
+# 2. Qwen2.5-VL 単一画像クラス分類
 # ==============================================================================
-class ObjectLabel(BaseModel):
-    label: str = Field(description="物体の簡潔な英語名称 (例: wooden block, mouse, scissors, pen, stapler)")
+def classify_single_crop_qwen(crop_bgr: np.ndarray, timeout_sec: float = 90.0) -> str:
+    """小さなクロップ画像を Qwen2.5-VL に渡し、経過時間を表示しながら分類させる"""
+    img_b64 = encode_crop_to_base64(crop_bgr, target_size=128)
 
-class BatchClassification(BaseModel):
-    items: List[ObjectLabel] = Field(description="各切り出し画像に対応するラベルのリスト")
-
-
-# ==============================================================================
-# 2. Gemini API 問い合わせ (クロップ画像の一括分類)
-# ==============================================================================
-def classify_crops_with_gemini(crop_images: List[np.ndarray]) -> List[str]:
-    """切り出された複数の物体画像を Gemini に一括送信して分類結果を取得"""
-    api_key = os.environ.get("GEMINI_API_KEY")
-    if not api_key:
-        print("❌ 'GEMINI_API_KEY' が設定されていません。")
-        return ["unknown"] * len(crop_images)
-
-    client = genai.Client(api_key=api_key)
-
-    # クロップ画像を PIL Image のリストに変換
-    contents = []
-    prompt = (
-        f"Here are {len(crop_images)} cropped images of small tabletop items.\n"
-        "Identify each item accurately with a concise name (e.g., 'wooden block', 'computer mouse', 'pen', 'scissors').\n"
-        "Return the classification list corresponding to the images in order."
+    prompt_text = (
+        "Identify this single tabletop object clearly in 1 to 3 words (e.g. 'wooden block', 'jenga block', 'mouse', 'pen', 'scissors', 'tape dispenser'). "
+        "Output ONLY the object name. No explanations, no markdown, no quotes."
     )
-    contents.append(prompt)
 
-    for img in crop_images:
-        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        contents.append(Image.fromarray(rgb))
+    request_payload = {
+        "model": MODEL_NAME,
+        "prompt": prompt_text,
+        "images": [img_b64],
+        "stream": False,
+        "options": {
+            "temperature": 0.1,
+            "num_predict": 16
+        }
+    }
 
-    print(f"⚡ {len(crop_images)} 個の物体サムネイルを Gemini に送信中...")
-    t0 = time.time()
+    req_data = json.dumps(request_payload).encode("utf-8")
+    req = urllib.request.Request(
+        OLLAMA_API_URL,
+        data=req_data,
+        headers={"Content-Type": "application/json"}
+    )
+
+    # 経過時間をコンソールにリアルタイム表示するウォッチャースレッド
+    stop_event = threading.Event()
+    start_time = time.time()
+
+    def print_progress():
+        while not stop_event.is_set():
+            elapsed = time.time() - start_time
+            sys.stdout.write(f"\r   ⏳ 推論中... 経過: {elapsed:.1f} 秒")
+            sys.stdout.flush()
+            time.sleep(1.0)
+
+    progress_thread = threading.Thread(target=print_progress, daemon=True)
+    progress_thread.start()
+
     try:
-        response = client.models.generate_content(
-            model=MODEL_ID,
-            contents=contents,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                response_schema=BatchClassification,
-                temperature=0.1
-            ),
-        )
-        elapsed = time.time() - t0
-        print(f"✅ 分類完了 (所要時間: {elapsed:.2f} 秒)")
-
-        import json
-        data = json.loads(response.text)
-        labels = [item.get("label", "unknown") for item in data.get("items", [])]
-
-        # 返答数整合
-        while len(labels) < len(crop_images):
-            labels.append("unknown")
-        return labels[:len(crop_images)]
-
+        # タイムアウトを 90 秒に延長
+        with urllib.request.urlopen(req, timeout=timeout_sec) as response:
+            res_body = json.loads(response.read().decode("utf-8"))
+            raw_text = res_body.get("response", "").strip()
+            cleaned = re.sub(r'[\r\n"\'`.]', '', raw_text)
+            return cleaned if cleaned else "unknown"
     except Exception as e:
-        print(f"❌ Gemini 分類エラー: {e}")
-        return ["unknown"] * len(crop_images)
+        sys.stdout.write("\n")
+        print(f"⚠️ Qwen 推論エラー: {e}")
+        return "unknown"
+    finally:
+        stop_event.set()
+        progress_thread.join()
+        sys.stdout.write("\r" + " " * 40 + "\r")  # プログレス行をクリア
+        sys.stdout.flush()
 
 
 # ==============================================================================
-# 3. OpenCV 物体検出 ＆ クロップ画像生成
+# 3. OpenCV 検出パイプライン
 # ==============================================================================
 def create_marker_mask(size: int = CANVAS_SIZE, margin: int = MARGIN) -> np.ndarray:
     mask = np.zeros((size, size), dtype=np.uint8)
@@ -126,7 +145,6 @@ def create_marker_mask(size: int = CANVAS_SIZE, margin: int = MARGIN) -> np.ndar
 
 
 def extract_objects_and_crops(warped_img: np.ndarray, bg_gray: Optional[np.ndarray], valid_mask: np.ndarray):
-    """輪郭検出および各物体のバウンディングボックス／クロップ画像を抽出"""
     gray = cv2.cvtColor(warped_img, cv2.COLOR_BGR2GRAY)
     blurred = cv2.GaussianBlur(gray, (5, 5), 0)
 
@@ -146,7 +164,6 @@ def extract_objects_and_crops(warped_img: np.ndarray, bg_gray: Optional[np.ndarr
 
     contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     detected = []
-
     h_img, w_img = warped_img.shape[:2]
 
     for cnt in contours:
@@ -169,14 +186,13 @@ def extract_objects_and_crops(warped_img: np.ndarray, bg_gray: Optional[np.ndarr
         box_pts = cv2.boxPoints(rect)
         box_pts = np.int32(box_pts)
 
-        # クロップ用外接矩形 (AABB) + パディング
+        # クロップ画像用の矩形 (AABB)
         bx, by, bw, bh = cv2.boundingRect(cnt)
-        pad = 12
+        pad = 10
         x1 = max(0, bx - pad)
         y1 = max(0, by - pad)
         x2 = min(w_img, bx + bw + pad)
         y2 = min(h_img, by + bh + pad)
-
         crop = warped_img[y1:y2, x1:x2]
 
         detected.append({
@@ -184,19 +200,21 @@ def extract_objects_and_crops(warped_img: np.ndarray, bg_gray: Optional[np.ndarr
             "v": cy,
             "angle_deg": angle,
             "box_pts": box_pts,
-            "crop": crop,
-            "aabb": (x1, y1, x2, y2)
+            "crop": crop
         })
 
     return detected, thresh
 
 
+# ==============================================================================
+# メインループ
+# ==============================================================================
 def main():
     print("==================================================")
-    print(" 🏷️ ハイブリッド物体同定ツール (OpenCV + Gemini)")
+    print(f" 🏷️ ハイブリッド物体同定ツール (OpenCV + {MODEL_NAME})")
     print("==================================================")
     print("【操作】")
-    print("  [C]     : 現在検出されている物体を Gemini で分類・同定")
+    print("  [C]     : 検出中の各物体を Qwen2.5-VL で個別分類")
     print("  [B]     : 現在の机面を背景として記憶（背景差分更新）")
     print("  [SPACE] : 4隅マーカーから正射影を再計算")
     print("  [Q/ESC] : 終了")
@@ -212,8 +230,7 @@ def main():
     valid_mask = create_marker_mask(CANVAS_SIZE, MARGIN)
     bg_gray = None
 
-    # 物体ラベルのキャッシュ辞書 (位置近傍追従)
-    cached_labels = {}  # slot_idx -> str
+    cached_labels = {}  # index -> str
 
     cv2.namedWindow("Tabletop Object Classifier")
 
@@ -236,22 +253,19 @@ def main():
             detected_objs, _ = extract_objects_and_crops(warped, bg_gray, valid_mask)
             annotated = warped.copy()
 
-            # 物体描画
+            # 検出結果の描画
             for i, obj in enumerate(detected_objs):
-                label = cached_labels.get(i, f"object_{i}")
+                label = cached_labels.get(i, f"item_{i}")
 
-                # 回転矩形
                 cv2.drawContours(annotated, [obj["box_pts"]], 0, (0, 255, 0), 2)
                 cv2.circle(annotated, (int(obj["u"]), int(obj["v"])), 4, (0, 0, 255), -1)
 
-                # ラベル描画
                 tag = f"#{i}: {label}"
                 cv2.putText(annotated, tag, (int(obj["u"]) - 40, int(obj["v"]) - 12),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 3, cv2.LINE_AA)
                 cv2.putText(annotated, tag, (int(obj["u"]) - 40, int(obj["v"]) - 12),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1, cv2.LINE_AA)
 
-            # 操作ガイド
             mode_text = "Diff" if bg_gray is not None else "Adaptive"
             cv2.putText(annotated, f"Detected: {len(detected_objs)} | Mode: {mode_text} | Press [C] to Classify",
                         (15, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, cv2.LINE_AA)
@@ -271,16 +285,21 @@ def main():
                 print("🔄 キャリブレーションを更新しました。")
             elif key in [ord('c'), ord('C')]:
                 if not detected_objs:
-                    print("⚠️ 分類対象の物体が机上に見つかりません。")
+                    print("⚠️ 分類対象の物体がありません。")
                     continue
 
-                crops = [obj["crop"] for obj in detected_objs if obj["crop"].size > 0]
-                labels = classify_crops_with_gemini(crops)
+                print(f"\n🧠 Qwen2.5-VL で {len(detected_objs)} 個の物体を順次分類中...")
+                cached_labels.clear()
 
-                print("\n🏷️ === 物体分類結果 ===")
-                for idx, lbl in enumerate(labels):
-                    cached_labels[idx] = lbl
-                    print(f"  Item #{idx}: {lbl}")
+                for idx, obj in enumerate(detected_objs):
+                    crop = obj["crop"]
+                    if crop.size == 0:
+                        continue
+                    t0 = time.time()
+                    name = classify_single_crop_qwen(crop)
+                    elapsed = time.time() - t0
+                    cached_labels[idx] = name
+                    print(f"  Item #{idx} ({elapsed:.2f}s): {name}")
 
     finally:
         cap.release()
