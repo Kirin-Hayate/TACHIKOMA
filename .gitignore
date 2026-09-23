@@ -10,5 +10,5 @@ __pycache__/
 venv/
 
 #デスクトップの画像
-.jpg
-.png
+*.jpg
+*.png
