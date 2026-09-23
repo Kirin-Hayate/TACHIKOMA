@@ -13,3 +13,6 @@ venv/
 *.jpg
 *.png
 *.jpeg
+
+# キャプチャデータ保存ディレクトリ全体を除外
+data/camera_captures/
