@@ -1,13 +1,23 @@
 """
 ==============================================================================
-マルチモーダル・デジタルツイン同期ツール
+マルチモーダル・デジタルツイン同期ツール (Gemini / Qwen 切替対応版)
 (tools/sync_digital_twin_multimodal.py)
 ==============================================================================
 【機能】
-1. カメラ画像から全物体を検出し、位置・傾き・ミリサイズを計測。
-2. [C] キー入力で全物体をコラージュして Gemini で名前・色・特徴を一括同定。
-3. 計測されたミリ寸法 (長辺x短辺) に合わせて MuJoCo の直方体形状を動的変形。
-4. MuJoCo 画面上の各物体の直上に物体名ラベルを 3D オーバーレイ表示。
+1. カメラ画像から全物体を OpenCV で検出し、物理座標・傾き・ミリ寸法を計測。
+2. [C] キー入力で全物体をコラージュ台紙化して VLM に一括推論リクエスト。
+3. 実行時引数に応じて推論エンジンを切り替え・フォールバック：
+   - --gemini        : Gemini API によるクラウド一括同定
+   - --qwen          : ローカル Ollama (qwen2.5vl:3b) による完全オフライン同定
+   - --gemini --qwen : Gemini 試行 ➔ 全モデル失敗時に Qwen へ自動フォールバック
+4. 計測されたミリ寸法 (長辺x短辺) に合わせて MuJoCo の直方体形状を動的変形。
+5. MuJoCo 画面上の各物体の直上に物体名ラベルを 3D オーバーレイ表示。
+
+【操作】
+  - [C]     : 全物体を同定し MuJoCo に直方体形状＆ラベルを反映
+  - [B]     : 机面背景の記憶 (高精度差分)
+  - [SPACE] : マーカー正射影の再計算
+  - [Q/ESC] : 終了
 ==============================================================================
 """
 
@@ -16,6 +26,11 @@ import os
 import time
 import json
 import math
+import re
+import argparse
+import base64
+import urllib.request
+import urllib.error
 import cv2
 import numpy as np
 import mujoco
@@ -40,6 +55,9 @@ from core.kinematics import get_home_radians
 from google import genai
 from google.genai import types
 
+import threading
+from contextlib import contextmanager
+
 # キャンバス・スロット設定
 CANVAS_SIZE = 500
 MARGIN = 50
@@ -52,6 +70,11 @@ HALF_Z = DEFAULT_OBJ_HEIGHT_M / 2.0
 MIN_AREA_PX = 600
 MAX_AREA_PX = 30000
 
+# Ollama 設定
+OLLAMA_API_URL = "http://localhost:11434/api/generate"
+QWEN_MODEL_NAME = "qwen2.5vl:3b"
+
+# Gemini 試行モデル候補
 CANDIDATE_MODELS = [
     "gemini-3.5-flash-lite",
     "gemini-3.5-flash",
@@ -59,7 +82,6 @@ CANDIDATE_MODELS = [
     "gemini-3.7-flash",
     "gemini-3.6-flash"
 ]
-
 
 # 操作要求フラグ
 REQ_SAVE_BG = False
@@ -159,27 +181,29 @@ def query_gemini_attributes(collage_bgr: np.ndarray, num_items: int) -> Dict[int
     pil_image = Image.fromarray(img_rgb)
 
     prompt = (
-        f"This image has {num_items} tabletop items arranged in a grid (#0, #1, ...).\n"
+        f"This composite image contains {num_items} tabletop object crops arranged in a grid (#0, #1, ...).\n"
         "Identify each item's canonical category name (e.g. 'pen', 'wooden block', 'eraser', 'mouse', 'ruler') "
-        "and primary color (e.g. 'red', 'blue', 'silver', 'black', 'natural wood').\n"
+        "and primary dominant color (e.g. 'red', 'blue', 'silver', 'black', 'natural wood').\n"
         "Return structured JSON matching the schema."
     )
 
     for model_name in CANDIDATE_MODELS:
         for attempt in range(2):
             try:
-                print(f"⚡ [{model_name}] へ推論リクエスト中... (試行 {attempt + 1}/2)")
+                print(f"⚡ [Gemini: {model_name}] へ推論リクエスト中... (試行 {attempt + 1}/2)")
                 t0 = time.time()
-                response = client.models.generate_content(
-                    model=model_name,
-                    contents=[pil_image, prompt],
-                    config=types.GenerateContentConfig(
-                        response_mime_type="application/json",
-                        response_schema=CollageClassificationResult,
-                        temperature=0.1
-                    ),
-                )
-                print(f"✅ 推論完了 ({model_name}, 所要時間: {time.time() - t0:.2f} 秒)")
+
+                with progress_timer(f"Gemini ({model_name}) 応答待機中"):
+                    response = client.models.generate_content(
+                        model=model_name,
+                        contents=[pil_image, prompt],
+                        config=types.GenerateContentConfig(
+                            response_mime_type="application/json",
+                            response_schema=CollageClassificationResult,
+                            temperature=0.1
+                        ),
+                    )
+                print(f"✅ Gemini 推論完了 ({model_name}, 所要時間: {time.time() - t0:.2f} 秒)")
                 data = json.loads(response.text)
                 res = {}
                 for item in data.get("items", []):
@@ -201,7 +225,116 @@ def query_gemini_attributes(collage_bgr: np.ndarray, num_items: int) -> Dict[int
 
 
 # ==============================================================================
-# 4. OpenCV 物体・幾何特徴抽出
+# 4. Qwen2.5-VL ローカル問い合わせ (Ollama)
+# ==============================================================================
+def query_qwen_attributes(collage_bgr: np.ndarray, num_items: int) -> Dict[int, Dict[str, str]]:
+    """コラージュ画像を Ollama (qwen2.5vl:3b) に投げ、JSON 形式で一括同定"""
+    success, buffer = cv2.imencode(".jpg", collage_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+    if not success:
+        return {}
+    img_b64 = base64.b64encode(buffer).decode("utf-8")
+
+    prompt = (
+        f"This composite image shows {num_items} tabletop object crops labeled #0 to #{num_items - 1}.\n"
+        "Identify each item's canonical category name (e.g. 'pen', 'wooden block', 'eraser', 'mouse', 'ruler') "
+        "and primary color (e.g. 'red', 'blue', 'silver', 'black', 'natural wood').\n"
+        "Output ONLY a raw JSON array matching this exact format:\n"
+        '[{"id": 0, "category": "pen", "color": "red"}, {"id": 1, "category": "mouse", "color": "black"}]\n'
+        "Do not include any explanation or markdown tags."
+    )
+
+    request_payload = {
+        "model": QWEN_MODEL_NAME,
+        "prompt": prompt,
+        "images": [img_b64],
+        "stream": False,
+        "options": {
+            "temperature": 0.1,
+            "num_predict": 512
+        }
+    }
+
+    req_data = json.dumps(request_payload).encode("utf-8")
+    req = urllib.request.Request(
+        OLLAMA_API_URL,
+        data=req_data,
+        headers={"Content-Type": "application/json"}
+    )
+
+    print(f"🦙 [Local Qwen: {QWEN_MODEL_NAME}] へ推論リクエスト中...")
+    t0 = time.time()
+    try:
+        with progress_timer(f"Qwen 推論中"):
+            with urllib.request.urlopen(req, timeout=90) as response:
+                res_body = json.loads(response.read().decode("utf-8"))
+            raw_text = res_body.get("response", "").strip()
+            
+            print(f"✅ Qwen 推論完了 (所要時間: {time.time() - t0:.2f} 秒)")
+
+            # JSON 部分の抽出
+            json_match = re.search(r'\[.*\]', raw_text, re.DOTALL)
+            if json_match:
+                items_data = json.loads(json_match.group(0))
+                res = {}
+                for item in items_data:
+                    res[int(item.get("id", 0))] = {
+                        "category": item.get("category", "unknown"),
+                        "color": item.get("color", "unknown"),
+                        "description": ""
+                    }
+                return res
+            else:
+                print(f"⚠️ Qwen の出力から JSON 配列を抽出できませんでした: {raw_text[:100]}...")
+                return {}
+    except Exception as e:
+        print(f"⚠️ Qwen 推論エラー: {e}")
+        return {}
+
+@contextmanager
+def progress_timer(label: str = "推論処理中"):
+    """API呼び出しや推論中に1秒間隔でコンソールに経過秒数を上書き表示する"""
+    stop_event = threading.Event()
+    start_time = time.time()
+
+    def _worker():
+        while not stop_event.wait(1.0):
+            elapsed = time.time() - start_time
+            sys.stdout.write(f"\r   ⏳ {label}... 経過: {elapsed:.1f} 秒")
+            sys.stdout.flush()
+
+    thread = threading.Thread(target=_worker, daemon=True)
+    thread.start()
+    try:
+        yield
+    finally:
+        stop_event.set()
+        thread.join()
+        sys.stdout.write("\r" + " " * 45 + "\r")  # プログレス表示行をクリア
+        sys.stdout.flush()
+# ==============================================================================
+# 5. 統合認識ディスパッチャ (Gemini / Qwen / ハイブリッドフォールバック)
+# ==============================================================================
+
+def dispatch_classification(collage_bgr: np.ndarray, num_items: int, use_gemini: bool, use_qwen: bool) -> Dict[int, Dict[str, str]]:
+    # 1. Gemini が有効な場合
+    if use_gemini:
+        attrs = query_gemini_attributes(collage_bgr, num_items)
+        if attrs:
+            return attrs
+        if not use_qwen:
+            print("❌ Gemini の推論に失敗しました (--qwen が指定されていないため中断)。")
+            return {}
+        print("🔄 Gemini の推論に失敗したため、ローカル Qwen にフォールバックします...")
+
+    # 2. Qwen が有効な場合（直接指定またはフォールバック）
+    if use_qwen:
+        return query_qwen_attributes(collage_bgr, num_items)
+
+    return {}
+
+
+# ==============================================================================
+# 6. OpenCV 物体・幾何特徴抽出
 # ==============================================================================
 def extract_objects_with_geometry(warped_img: np.ndarray, bg_gray: Optional[np.ndarray], valid_mask: np.ndarray, projector: VisionProjector):
     gray = cv2.cvtColor(warped_img, cv2.COLOR_BGR2GRAY)
@@ -225,7 +358,6 @@ def extract_objects_with_geometry(warped_img: np.ndarray, bg_gray: Optional[np.n
     detected = []
     h_img, w_img = warped_img.shape[:2]
 
-    # 正射影 400px = 400mm (1px = 1mm)
     for cnt in contours:
         area = cv2.contourArea(cnt)
         if not (MIN_AREA_PX <= area <= MAX_AREA_PX):
@@ -246,7 +378,6 @@ def extract_objects_with_geometry(warped_img: np.ndarray, bg_gray: Optional[np.n
         box_pts = np.int32(cv2.boxPoints(rect))
         x_mm, y_mm = pixel_to_robot_phys_xy(cx, cy, projector)
 
-        # クロップ画像
         bx, by, bw, bh = cv2.boundingRect(cnt)
         pad = 10
         x1, y1 = max(0, bx - pad), max(0, by - pad)
@@ -277,28 +408,21 @@ def custom_sim_key_callback(keycode: int):
     elif keycode in (81, 113, 256):  # Q, q, ESC
         REQ_QUIT = True
 
+
 def draw_aruco_markers_in_mujoco(sim, projector, marker_size_m: float = 0.04):
-    """
-    MuJoCo 3D 空間上に 4 隅の ArUco マーカーを正方形ジオメトリとして描画し、
-    各頂点にマーカー ID ラベルを配置する
-    """
     if sim.viewer is None:
         return
 
-    # marker_size: 一辺 40mm 相当 (half-size: 20mm x 20mm x 0.1mm)
     half_s = marker_size_m / 2.0
-    half_th = 0.0002  # 厚み 0.2mm (ほぼゼロで机面に重畳)
+    half_th = 0.0002
 
-    # 4隅のマーカー物理座標 (0:左奥, 1:右奥, 2:左手前, 3:右手前)
     for marker_idx in range(4):
         phys_x, phys_y = projector.marker_phys_xy[marker_idx]
-
-        # MuJoCo ワールド座標変換 (右: +X, 正面: -Y, 机面直上 Z: 0.2mm)
         mj_x = -phys_y / 1000.0
         mj_y = -phys_x / 1000.0
         mj_z = half_th
 
-        # 1. 正方形タイル (黒枠つき白色プレート)
+        # 白地プレート
         if sim.viewer.user_scn.ngeom < sim.viewer.user_scn.maxgeom:
             ng = sim.viewer.user_scn.ngeom
             mujoco.mjv_initGeom(
@@ -307,11 +431,11 @@ def draw_aruco_markers_in_mujoco(sim, projector, marker_size_m: float = 0.04):
                 size=np.array([half_s, half_s, half_th], dtype=np.float64),
                 pos=np.array([mj_x, mj_y, mj_z], dtype=np.float64),
                 mat=np.eye(3).flatten(),
-                rgba=np.array([0.9, 0.9, 0.9, 0.95], dtype=np.float32)  # 白地プレート
+                rgba=np.array([0.9, 0.9, 0.9, 0.95], dtype=np.float32)
             )
             sim.viewer.user_scn.ngeom += 1
 
-        # 2. マーカー中央の黒正方形 (ArUco パターンを模した中央黒部)
+        # 中央黒正方形
         if sim.viewer.user_scn.ngeom < sim.viewer.user_scn.maxgeom:
             ng = sim.viewer.user_scn.ngeom
             mujoco.mjv_initGeom(
@@ -320,11 +444,11 @@ def draw_aruco_markers_in_mujoco(sim, projector, marker_size_m: float = 0.04):
                 size=np.array([half_s * 0.6, half_s * 0.6, half_th * 1.5], dtype=np.float64),
                 pos=np.array([mj_x, mj_y, mj_z + 0.0001], dtype=np.float64),
                 mat=np.eye(3).flatten(),
-                rgba=np.array([0.05, 0.05, 0.05, 1.0], dtype=np.float32)  # 黒正方形
+                rgba=np.array([0.05, 0.05, 0.05, 1.0], dtype=np.float32)
             )
             sim.viewer.user_scn.ngeom += 1
 
-        # 3. マーカー直上の ID ラベル
+        # ID ラベル
         if sim.viewer.user_scn.ngeom < sim.viewer.user_scn.maxgeom:
             ng = sim.viewer.user_scn.ngeom
             lbl_pos = np.array([mj_x, mj_y, mj_z + 0.025], dtype=np.float64)
@@ -334,17 +458,43 @@ def draw_aruco_markers_in_mujoco(sim, projector, marker_size_m: float = 0.04):
                 size=np.zeros(3),
                 pos=lbl_pos,
                 mat=np.eye(3).flatten(),
-                rgba=np.array([0.3, 0.8, 1.0, 1.0], dtype=np.float32)  # 水色テキスト
+                rgba=np.array([0.3, 0.8, 1.0, 1.0], dtype=np.float32)
             )
             sim.viewer.user_scn.geoms[ng].label = f"ArUco #{marker_idx}".encode("utf-8")
             sim.viewer.user_scn.ngeom += 1
+
+
 # ==============================================================================
 # メイン処理
 # ==============================================================================
 def main():
     global REQ_SAVE_BG, REQ_RECALIB, REQ_CLASSIFY, REQ_QUIT
+
+    # 引数パース
+    parser = argparse.ArgumentParser(description="Tachikoma Multimodal Digital Twin")
+    parser.add_argument("--gemini", action="store_true", help="Gemini API による認識を有効化")
+    parser.add_argument("--qwen", action="store_true", help="ローカル Qwen2.5-VL による認識を有効化")
+    args = parser.parse_args()
+
+    use_gemini = args.gemini
+    use_qwen = args.qwen
+
+    # 両方未指定の場合はハイブリッド（Gemini優先 ➔ Qwenフォールバック）をデフォルトとする
+    if not use_gemini and not use_qwen:
+        use_gemini = True
+        use_qwen = True
+
+    mode_desc = []
+    if use_gemini and use_qwen:
+        mode_desc.append("Gemini (Fallback to Qwen)")
+    elif use_gemini:
+        mode_desc.append("Gemini Only")
+    elif use_qwen:
+        mode_desc.append("Qwen Only (Offline)")
+
     print("==================================================")
     print(" 🌐 マルチモーダル・デジタルツイン同期システム")
+    print(f" ⚙️ 認識エンジン: {mode_desc[0]}")
     print("==================================================")
     print("【操作】")
     print("  [C]     : 全物体を同定し MuJoCo に直方体形状＆ラベルを反映")
@@ -353,7 +503,7 @@ def main():
     print("  [Q/ESC] : 終了")
     print("--------------------------------------------------")
 
-    # 1. MuJoCo ビューアの初期化
+    # 1. MuJoCo ビューア初期化
     sim = MujocoSimViewer()
     home_rad = get_home_radians()
     try:
@@ -361,7 +511,6 @@ def main():
     except Exception:
         pass
 
-    # ビューア起動
     sim.viewer = mujoco.viewer.launch_passive(
         sim.model, sim.data, key_callback=custom_sim_key_callback
     )
@@ -369,18 +518,15 @@ def main():
     # 各スロットのアドレスと geom_id を解決（新旧両方の命名規則に対応）
     slot_info = []
     for i in range(MAX_SLOTS):
-        # 1. 新命名 (obj_block_i / geom_obj_i) を検索
         bname = f"obj_block_{i}"
         gname = f"geom_obj_{i}"
         bid = mujoco.mj_name2id(sim.model, mujoco.mjtObj.mjOBJ_BODY, bname)
         gid = mujoco.mj_name2id(sim.model, mujoco.mjtObj.mjOBJ_GEOM, gname)
 
-        # 2. 見つからなければ旧命名 (jenga_block_i) を検索
         if bid == -1:
             bname = f"jenga_block_{i}"
             bid = mujoco.mj_name2id(sim.model, mujoco.mjtObj.mjOBJ_BODY, bname)
             if bid != -1:
-                # ボディ内の最初の geom を取得
                 gid = sim.model.body_geomadr[bid]
 
         qpos_adr = None
@@ -395,6 +541,7 @@ def main():
     print(f"✅ MuJoCo 内に {valid_count} 個の物体スロットを検出・バインドしました。")
     if valid_count == 0:
         print("❌ 警告: 有効な物体スロットが MuJoCo モデル内に見つかりません！assets/so100_scene.xml を確認してください。")
+
     # 2. カメラ初期化
     projector = VisionProjector()
     cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
@@ -438,17 +585,16 @@ def main():
                 REQ_RECALIB = False
                 print("🔄 キャリブレーションを更新しました。")
 
-# 物体検出
             detected_objs, _ = extract_objects_with_geometry(warped, bg_gray, valid_mask, projector)
             annotated = warped.copy()
 
-            # [C] キーによる Gemini 一括同定処理
+            # [C] キーによる物体一括同定
             if REQ_CLASSIFY:
                 REQ_CLASSIFY = False
                 if detected_objs:
                     crops = [obj["crop"] for obj in detected_objs if obj["crop"].size > 0]
                     collage_img, _, _ = build_adaptive_collage(crops, tile_size=160)
-                    ai_attrs = query_gemini_attributes(collage_img, len(crops))
+                    ai_attrs = dispatch_classification(collage_img, len(crops), use_gemini, use_qwen)
 
                     object_profiles.clear()
                     print("\n📦 === 物体同定結果一覧 ===")
@@ -462,33 +608,25 @@ def main():
                         }
                         print(f"  [#{idx}] {display_name} ({obj['size_mm'][0]}x{obj['size_mm'][1]}mm)")
 
-            # ================================================================
-            # 1. OpenCV 画面へのバウンディングボックス＆ラベル描画（ここを確実に行う）
-            # ================================================================
+            # 1. OpenCV 画面へのバウンディングボックス＆ラベル描画
             for i, obj in enumerate(detected_objs):
                 prof = object_profiles.get(i, {})
                 label_name = prof.get("display_name", f"#{i}")
 
-                # 輪郭回転矩形 (緑色)
                 cv2.drawContours(annotated, [obj["box_pts"]], 0, (0, 255, 0), 2)
-                # 中心点 (赤丸)
                 u_pt, v_pt = int(obj["u"]), int(obj["v"])
                 cv2.circle(annotated, (u_pt, v_pt), 4, (0, 0, 255), -1)
 
-                # ラベルテキスト
                 tag = f"#{i}: {label_name}"
                 cv2.putText(annotated, tag, (u_pt - 40, v_pt - 12),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 3, cv2.LINE_AA)
                 cv2.putText(annotated, tag, (u_pt - 40, v_pt - 12),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1, cv2.LINE_AA)
 
-            # ================================================================
             # 2. MuJoCo 空間への動的反映
-            # ================================================================
             if sim.viewer is not None:
                 sim.viewer.user_scn.ngeom = 0
 
-            # ArUco マーカー正方形の描画
             draw_aruco_markers_in_mujoco(sim, projector, marker_size_m=0.04)
 
             for i in range(MAX_SLOTS):
@@ -503,7 +641,6 @@ def main():
                     x_mm, y_mm = obj["phys_xy"]
                     major_mm, minor_mm = obj["size_mm"]
 
-                    # 座標変換 (正面: -Y, 右: +X)
                     mj_x = -y_mm / 1000.0
                     mj_y = -x_mm / 1000.0
                     mj_z = HALF_Z
@@ -511,22 +648,21 @@ def main():
                     yaw_rad = math.radians(-obj["angle_deg"])
                     quat = euler_yaw_to_quat(yaw_rad)
 
-                    # 1. 位置・姿勢の更新
+                    # 位置・姿勢
                     sim.data.qpos[qadr:qadr + 3] = [mj_x, mj_y, mj_z]
                     sim.data.qpos[qadr + 3:qadr + 7] = quat
 
-                    # 2. 直方体サイズ (half-size: X=長辺, Y=短辺, Z=厚み)
+                    # 直方体サイズ (half-size)
                     half_x = max(0.005, (major_mm / 1000.0) / 2.0)
                     half_y = max(0.005, (minor_mm / 1000.0) / 2.0)
                     sim.model.geom_size[gid] = [half_x, half_y, HALF_Z]
 
-                    # 3. 3D空間上のラベル描画
+                    # 3Dラベル描画
                     prof = object_profiles.get(i, {})
                     label_name = prof.get("display_name", f"#{i}")
 
                     if sim.viewer is not None and sim.viewer.user_scn.ngeom < sim.viewer.user_scn.maxgeom:
                         ngeom = sim.viewer.user_scn.ngeom
-                        # 物体の少し上 (Z + 30mm) にテキストマーカーを配置
                         label_pos = np.array([mj_x, mj_y, mj_z + 0.03], dtype=np.float64)
                         mujoco.mjv_initGeom(
                             sim.viewer.user_scn.geoms[ngeom],
@@ -539,24 +675,21 @@ def main():
                         sim.viewer.user_scn.geoms[ngeom].label = label_name.encode("utf-8")
                         sim.viewer.user_scn.ngeom += 1
                 else:
-                    # 未検出スロットは机の下へ退避
+                    # 机の下へ退避
                     sim.data.qpos[qadr:qadr + 3] = [0.0, 0.0, -1.0]
                     sim.data.qpos[qadr + 3:qadr + 7] = [1.0, 0.0, 0.0, 0.0]
 
-            # 物理演算・描画同期
             mujoco.mj_forward(sim.model, sim.data)
             if sim.viewer is not None:
                 sim.viewer.sync()
 
-            # 左上ステータス表示
             mode_text = "Diff" if bg_gray is not None else "Adaptive"
-            cv2.putText(annotated, f"Detected: {len(detected_objs)} | Mode: {mode_text} | Press [C] to Identify",
+            engine_text = "Gemini+Qwen" if (use_gemini and use_qwen) else ("Gemini" if use_gemini else "Qwen")
+            cv2.putText(annotated, f"Detected: {len(detected_objs)} | Engine: {engine_text} | Press [C] to Identify",
                         (15, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, cv2.LINE_AA)
 
-            # 👉 必ず描画済みの annotated を表示
             cv2.imshow("Digital Twin Multi-modal Profiler", annotated)
 
-            # OpenCV キー処理
             k = cv2.waitKey(1) & 0xFF
             if k in [ord('q'), ord('Q'), 27]:
                 break

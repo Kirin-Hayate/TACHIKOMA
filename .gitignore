@@ -16,3 +16,4 @@ venv/
 
 # キャプチャデータ保存ディレクトリ全体を除外
 data/camera_captures/
+data/camera_captures/gemini_collage_input.jpg
