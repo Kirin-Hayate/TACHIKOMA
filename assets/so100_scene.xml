@@ -84,39 +84,71 @@
     </body>
 
     <!-- ================================================================= -->
-    <!-- デジタルツイン同期用: ジェンガブロック群 (最大8個)                 -->
+    <!-- デジタルツイン同期用: 汎用物体直方体ブロック群 (最大16個)           -->
     <!-- ================================================================= -->
-    <body name="jenga_block_0" pos="0 0 -1">
+    <body name="obj_block_0" pos="0 0 -1">
       <freejoint/>
-      <geom type="box" size="0.0375 0.0125 0.0075" material="wood_mat" mass="0.015"/>
+      <geom name="geom_obj_0" type="box" size="0.02 0.02 0.01" material="wood_mat" mass="0.02"/>
     </body>
-    <body name="jenga_block_1" pos="0 0 -1">
+    <body name="obj_block_1" pos="0 0 -1">
       <freejoint/>
-      <geom type="box" size="0.0375 0.0125 0.0075" material="wood_mat" mass="0.015"/>
+      <geom name="geom_obj_1" type="box" size="0.02 0.02 0.01" material="wood_mat" mass="0.02"/>
     </body>
-    <body name="jenga_block_2" pos="0 0 -1">
+    <body name="obj_block_2" pos="0 0 -1">
       <freejoint/>
-      <geom type="box" size="0.0375 0.0125 0.0075" material="wood_mat" mass="0.015"/>
+      <geom name="geom_obj_2" type="box" size="0.02 0.02 0.01" material="wood_mat" mass="0.02"/>
     </body>
-    <body name="jenga_block_3" pos="0 0 -1">
+    <body name="obj_block_3" pos="0 0 -1">
       <freejoint/>
-      <geom type="box" size="0.0375 0.0125 0.0075" material="wood_mat" mass="0.015"/>
+      <geom name="geom_obj_3" type="box" size="0.02 0.02 0.01" material="wood_mat" mass="0.02"/>
     </body>
-    <body name="jenga_block_4" pos="0 0 -1">
+    <body name="obj_block_4" pos="0 0 -1">
       <freejoint/>
-      <geom type="box" size="0.0375 0.0125 0.0075" material="wood_mat" mass="0.015"/>
+      <geom name="geom_obj_4" type="box" size="0.02 0.02 0.01" material="wood_mat" mass="0.02"/>
     </body>
-    <body name="jenga_block_5" pos="0 0 -1">
+    <body name="obj_block_5" pos="0 0 -1">
       <freejoint/>
-      <geom type="box" size="0.0375 0.0125 0.0075" material="wood_mat" mass="0.015"/>
+      <geom name="geom_obj_5" type="box" size="0.02 0.02 0.01" material="wood_mat" mass="0.02"/>
     </body>
-    <body name="jenga_block_6" pos="0 0 -1">
+    <body name="obj_block_6" pos="0 0 -1">
       <freejoint/>
-      <geom type="box" size="0.0375 0.0125 0.0075" material="wood_mat" mass="0.015"/>
+      <geom name="geom_obj_6" type="box" size="0.02 0.02 0.01" material="wood_mat" mass="0.02"/>
     </body>
-    <body name="jenga_block_7" pos="0 0 -1">
+    <body name="obj_block_7" pos="0 0 -1">
       <freejoint/>
-      <geom type="box" size="0.0375 0.0125 0.0075" material="wood_mat" mass="0.015"/>
+      <geom name="geom_obj_7" type="box" size="0.02 0.02 0.01" material="wood_mat" mass="0.02"/>
+    </body>
+    <body name="obj_block_8" pos="0 0 -1">
+      <freejoint/>
+      <geom name="geom_obj_8" type="box" size="0.02 0.02 0.01" material="wood_mat" mass="0.02"/>
+    </body>
+    <body name="obj_block_9" pos="0 0 -1">
+      <freejoint/>
+      <geom name="geom_obj_9" type="box" size="0.02 0.02 0.01" material="wood_mat" mass="0.02"/>
+    </body>
+    <body name="obj_block_10" pos="0 0 -1">
+      <freejoint/>
+      <geom name="geom_obj_10" type="box" size="0.02 0.02 0.01" material="wood_mat" mass="0.02"/>
+    </body>
+    <body name="obj_block_11" pos="0 0 -1">
+      <freejoint/>
+      <geom name="geom_obj_11" type="box" size="0.02 0.02 0.01" material="wood_mat" mass="0.02"/>
+    </body>
+    <body name="obj_block_12" pos="0 0 -1">
+      <freejoint/>
+      <geom name="geom_obj_12" type="box" size="0.02 0.02 0.01" material="wood_mat" mass="0.02"/>
+    </body>
+    <body name="obj_block_13" pos="0 0 -1">
+      <freejoint/>
+      <geom name="geom_obj_13" type="box" size="0.02 0.02 0.01" material="wood_mat" mass="0.02"/>
+    </body>
+    <body name="obj_block_14" pos="0 0 -1">
+      <freejoint/>
+      <geom name="geom_obj_14" type="box" size="0.02 0.02 0.01" material="wood_mat" mass="0.02"/>
+    </body>
+    <body name="obj_block_15" pos="0 0 -1">
+      <freejoint/>
+      <geom name="geom_obj_15" type="box" size="0.02 0.02 0.01" material="wood_mat" mass="0.02"/>
     </body>
   </worldbody>
 </mujoco>
