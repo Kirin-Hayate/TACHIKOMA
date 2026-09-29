@@ -339,27 +339,32 @@ x_phys_mm: float,
     # 1. 極座標系変換
     base_theta_deg = math.degrees(math.atan2(y_phys_mm, x_phys_mm))
 
-    # 2. 手首ロール角 (ID 5) アライメント
-    rel_roll_deg_1 = angle_deg - base_theta_deg
+    # --------------------------------------------------------------------------
+    # 2. 手首ロール角 (ID 5) のアライメント算出 (実測反転モデル)
+    # --------------------------------------------------------------------------
+    # 幾何学的関係: wrist_roll は -(obj_angle - base_theta) に追従
+    rel_roll_deg_1 = -(angle_deg - base_theta_deg)
+    
+    # 180° 対称性の正規化 (-90° 〜 +90°)
     while rel_roll_deg_1 > 90.0:
         rel_roll_deg_1 -= 180.0
     while rel_roll_deg_1 <= -90.0:
         rel_roll_deg_1 += 180.0
 
+    # 180° 反対向き候補
     rel_roll_deg_2 = rel_roll_deg_1 + 180.0 if rel_roll_deg_1 < 0 else rel_roll_deg_1 - 180.0
 
-    cand_rad_1 = WRIST_ROLL_HORIZONTAL_RAD + math.radians(rel_roll_deg_1)
-    cand_rad_2 = WRIST_ROLL_HORIZONTAL_RAD + math.radians(rel_roll_deg_2)
-
-    # 候補1・候補2 の選定
-    if abs(cand_rad_1) <= abs(cand_rad_2):
+    # 原点 (0 rad / Raw≈3072) からの変位が小さく、可動域に余裕がある方を rel_roll_deg として確定
+    if abs(rel_roll_deg_1) <= abs(rel_roll_deg_2):
         rel_roll_deg = rel_roll_deg_1
-        wrist_roll_rad = cand_rad_1
     else:
         rel_roll_deg = rel_roll_deg_2
-        wrist_roll_rad = cand_rad_2
 
-    # 3. 非対称爪補正
+    wrist_roll_rad = math.radians(rel_roll_deg)
+
+    # --------------------------------------------------------------------------
+    # 3. 非対称爪（固定爪干渉回避）の目標点補正
+    # --------------------------------------------------------------------------
     asym_shift_m = min(0.015, GRIPPER_ASYM_OFFSET_M + (min(25.0, obj_thickness_mm) / 2000.0))
     global_yaw_rad = math.radians(base_theta_deg + rel_roll_deg)
     shift_dx_m = -asym_shift_m * math.sin(global_yaw_rad)
