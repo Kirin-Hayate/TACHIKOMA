@@ -183,7 +183,7 @@ def main():
                     print(f"   傾き: {angle_deg:+.1f}°")
 
                     # 机面から物体厚みの半分（約8mm）を把持点とする
-                    z_grasp_mm = 8.0
+                    z_grasp_mm = 15.0
 
                     # 逆運動学の解決（手首ロール・非対称爪オフセット自動計算）
                     ik_grasp, ik_wp, adopted_pitch = solve_ik_tabletop_grasp(
