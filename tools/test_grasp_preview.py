@@ -7,7 +7,9 @@
 1. カメラ画像から机上の物体を検出。
 2. MuJoCo 空間上に検出物体を「直方体 (寸法・向き反映)」としてリアルタイム同期。
 3. 選択中ターゲット (#0〜#9) の直上にマーカーとターゲット表示を重畳。
-4. [G] キーで把持シーケンスを実行し、爪の挟み込み角度や位置アライメントを目視検証。
+4. [G] キーで把持シーケンスを実行：
+   - 把持する瞬間に「幾何目標TCP (水色)」と「たわみ反映実機予想TCP (赤色)」を3Dマーカー表示。
+   - 爪の挟み込み角度や位置アライメントを目視検証。
 
 【操作】
   - [0]〜[9] : 把持対象物体の選択
@@ -27,7 +29,7 @@ import cv2
 import numpy as np
 import mujoco
 import mujoco.viewer
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if BASE_DIR not in sys.path:
@@ -39,6 +41,7 @@ from core.tabletop_detector import TabletopDetector
 from core.kinematics import (
     get_home_radians,
     solve_ik_tabletop_grasp,
+    calculate_sag_compensation,
     GRIPPER_OPEN_RAD,
     GRIPPER_CLOSE_RAD
 )
@@ -53,6 +56,10 @@ REQ_GO_HOME = False
 REQ_SAVE_BG = False
 REQ_RECALIB = False
 REQ_QUIT = False
+
+# 把持の瞬間に表示する TCP マーカー座標 [mj_x, mj_y, mj_z]
+# {"target_tcp": np.ndarray, "sag_tcp": np.ndarray}
+CURRENT_GRASP_TCP_MARKERS: Optional[Dict[str, np.ndarray]] = None
 
 
 def custom_sim_key_callback(keycode: int):
@@ -76,9 +83,9 @@ def euler_yaw_to_quat(yaw_rad: float) -> np.ndarray:
     half = yaw_rad / 2.0
     return np.array([math.cos(half), 0.0, 0.0, math.sin(half)], dtype=np.float64)
 
-
-def interpolate_motion(sim, target_rad: Dict[int, float], steps: int = 35, delay_sec: float = 0.02):
-    """現在の関節角度から目標姿勢へスムーズに補間アニメーション"""
+def interpolate_motion(sim, target_rad: Dict[int, float], steps: int = 35, delay_sec: float = 0.02, projector=None):
+    """現在の関節角度から目標姿勢へスムーズに補間アニメーション (バッファ溢れ防止対応)"""
+    global CURRENT_GRASP_TCP_MARKERS
     start_qpos = np.copy(sim.data.qpos[:6])
     target_qpos = np.copy(start_qpos)
 
@@ -93,10 +100,17 @@ def interpolate_motion(sim, target_rad: Dict[int, float], steps: int = 35, delay
         sim.data.qpos[:6] = current
 
         mujoco.mj_forward(sim.model, sim.data)
-        if sim.viewer is not None:
-            sim.viewer.sync()
-        time.sleep(delay_sec)
 
+        if sim.viewer is not None:
+            # 👉 毎フレーム描画バッファをリセットしてオーバーフローを防ぐ
+            sim.viewer.user_scn.ngeom = 0
+            if projector is not None:
+                draw_aruco_markers_in_mujoco(sim, projector, marker_size_m=0.04)
+            if CURRENT_GRASP_TCP_MARKERS is not None:
+                draw_grasp_point_markers(sim, CURRENT_GRASP_TCP_MARKERS)
+            sim.viewer.sync()
+
+        time.sleep(delay_sec)
 
 def draw_aruco_markers_in_mujoco(sim, projector, marker_size_m: float = 0.04):
     if sim.viewer is None:
@@ -136,8 +150,75 @@ def draw_aruco_markers_in_mujoco(sim, projector, marker_size_m: float = 0.04):
             sim.viewer.user_scn.ngeom += 1
 
 
+def draw_grasp_point_markers(sim, markers_dict: Dict[str, np.ndarray]):
+    """
+    把持時の手先目標点 (水色) と、たわみ沈み込みを反映した予想到達点 (赤色) を球体＋ラベルで表示
+    """
+    if sim.viewer is None or not markers_dict:
+        return
+
+    # 1. 幾何目標 TCP (水色球)
+    target_pos = markers_dict.get("target_tcp")
+    if target_pos is not None and sim.viewer.user_scn.ngeom < sim.viewer.user_scn.maxgeom:
+        ng = sim.viewer.user_scn.ngeom
+        mujoco.mjv_initGeom(
+            sim.viewer.user_scn.geoms[ng],
+            type=mujoco.mjtGeom.mjGEOM_SPHERE,
+            size=np.array([0.008, 0.008, 0.008], dtype=np.float64),
+            pos=target_pos,
+            mat=np.eye(3).flatten(),
+            rgba=np.array([0.1, 0.8, 1.0, 0.9], dtype=np.float32)
+        )
+        sim.viewer.user_scn.ngeom += 1
+
+        # 目標点ラベル
+        if sim.viewer.user_scn.ngeom < sim.viewer.user_scn.maxgeom:
+            ng = sim.viewer.user_scn.ngeom
+            lbl_pos = target_pos + np.array([0.0, 0.0, 0.015])
+            mujoco.mjv_initGeom(
+                sim.viewer.user_scn.geoms[ng],
+                type=mujoco.mjtGeom.mjGEOM_LABEL,
+                size=np.zeros(3),
+                pos=lbl_pos,
+                mat=np.eye(3).flatten(),
+                rgba=np.array([0.1, 0.8, 1.0, 1.0], dtype=np.float32)
+            )
+            sim.viewer.user_scn.geoms[ng].label = "Target TCP".encode("utf-8")
+            sim.viewer.user_scn.ngeom += 1
+
+    # 2. 実機たわみ反映の予想 TCP (赤色球)
+    sag_pos = markers_dict.get("sag_tcp")
+    if sag_pos is not None and sim.viewer.user_scn.ngeom < sim.viewer.user_scn.maxgeom:
+        ng = sim.viewer.user_scn.ngeom
+        mujoco.mjv_initGeom(
+            sim.viewer.user_scn.geoms[ng],
+            type=mujoco.mjtGeom.mjGEOM_SPHERE,
+            size=np.array([0.008, 0.008, 0.008], dtype=np.float64),
+            pos=sag_pos,
+            mat=np.eye(3).flatten(),
+            rgba=np.array([1.0, 0.2, 0.2, 0.95], dtype=np.float32)
+        )
+        sim.viewer.user_scn.ngeom += 1
+
+        # 沈み込み点ラベル
+        if sim.viewer.user_scn.ngeom < sim.viewer.user_scn.maxgeom:
+            ng = sim.viewer.user_scn.ngeom
+            lbl_pos = sag_pos + np.array([0.0, 0.0, -0.015])
+            mujoco.mjv_initGeom(
+                sim.viewer.user_scn.geoms[ng],
+                type=mujoco.mjtGeom.mjGEOM_LABEL,
+                size=np.zeros(3),
+                pos=lbl_pos,
+                mat=np.eye(3).flatten(),
+                rgba=np.array([1.0, 0.3, 0.3, 1.0], dtype=np.float32)
+            )
+            sim.viewer.user_scn.geoms[ng].label = "Actual Sag TCP".encode("utf-8")
+            sim.viewer.user_scn.ngeom += 1
+
+
 def main():
     global SELECTED_TARGET_IDX, REQ_EXEC_GRASP, REQ_GO_HOME, REQ_SAVE_BG, REQ_RECALIB, REQ_QUIT
+    global CURRENT_GRASP_TCP_MARKERS
 
     print("==================================================")
     print(" 🤖 把持プレビュー ＆ 物体 3D デジタルツイン同期")
@@ -162,7 +243,6 @@ def main():
         sim.model, sim.data, key_callback=custom_sim_key_callback
     )
 
-    # スロット初期化
     slot_info = []
     for i in range(MAX_SLOTS):
         bname = f"obj_block_{i}"
@@ -222,11 +302,15 @@ def main():
             # 2. OpenCV 画面描画
             annotated = detector.draw_annotations(warped, detected_objs, target_idx=SELECTED_TARGET_IDX)
 
-            # 3. MuJoCo 空間への動的反映 (直方体とマーカー)
+            # 3. MuJoCo 空間への動的反映
             if sim.viewer is not None:
                 sim.viewer.user_scn.ngeom = 0
 
             draw_aruco_markers_in_mujoco(sim, projector, marker_size_m=0.04)
+
+            # 👉 把持の瞬間に計算された TCP マーカーを描画
+            if CURRENT_GRASP_TCP_MARKERS is not None:
+                draw_grasp_point_markers(sim, CURRENT_GRASP_TCP_MARKERS)
 
             for i in range(MAX_SLOTS):
                 sinfo = slot_info[i]
@@ -243,16 +327,13 @@ def main():
                     mj_y = -x_mm / 1000.0
                     yaw_rad = math.radians(-obj["angle_deg"])
 
-                    # 位置と向きの更新
                     sim.data.qpos[qadr:qadr + 3] = [mj_x, mj_y, HALF_Z]
                     sim.data.qpos[qadr + 3:qadr + 7] = euler_yaw_to_quat(yaw_rad)
 
-                    # 直方体サイズの動的反映 (half-size)
                     half_x = max(0.005, (major_mm / 1000.0) / 2.0)
                     half_y = max(0.005, (minor_mm / 1000.0) / 2.0)
                     sim.model.geom_size[gid] = [half_x, half_y, HALF_Z]
 
-                    # 選択ターゲット強調ラベル
                     is_target = (i == SELECTED_TARGET_IDX)
                     label_text = f"#{i} TARGET" if is_target else f"#{i}"
                     rgba = np.array([1.0, 0.3, 0.3, 1.0]) if is_target else np.array([1.0, 1.0, 0.2, 1.0])
@@ -277,12 +358,14 @@ def main():
             # 4. ホーム復帰
             if REQ_GO_HOME:
                 REQ_GO_HOME = False
+                CURRENT_GRASP_TCP_MARKERS = None  # マーカー消去
                 print("🏠 ホーム姿勢へ戻ります...")
                 interpolate_motion(sim, home_rad, steps=25)
 
-            # 5. 把持プレビュー実行
+# 5. 把持プレビュー実行
             if REQ_EXEC_GRASP:
                 REQ_EXEC_GRASP = False
+
                 if SELECTED_TARGET_IDX < len(detected_objs):
                     target_obj = detected_objs[SELECTED_TARGET_IDX]
                     x_mm, y_mm = target_obj["phys_xy"]
@@ -297,6 +380,22 @@ def main():
 
                     z_grasp_mm = 14.0
 
+                    # 沈み込み量推計 (m)
+                    r_phys_m = math.hypot(x_mm, y_mm) / 1000.0
+                    theta_phys_rad = math.atan2(y_mm, x_mm)
+                    sag_offset_m = calculate_sag_compensation(r_phys_m, theta_phys_rad)
+
+                    # MuJoCo ワールド座標での把持点
+                    mj_target_x = -y_mm / 1000.0
+                    mj_target_y = -x_mm / 1000.0
+                    mj_target_z = z_grasp_mm / 1000.0
+
+                    # 👉 【修正】計算完了と同時にマーカーを設定 (動作中ずっと表示)
+                    CURRENT_GRASP_TCP_MARKERS = {
+                        "target_tcp": np.array([mj_target_x, mj_target_y, mj_target_z]),
+                        "sag_tcp": np.array([mj_target_x, mj_target_y, mj_target_z - sag_offset_m])
+                    }
+
                     ik_grasp, ik_wp, adopted_pitch = solve_ik_tabletop_grasp(
                         x_phys_mm=x_mm,
                         y_phys_mm=y_mm,
@@ -310,36 +409,37 @@ def main():
 
                     if ik_grasp is None or ik_wp is None:
                         print("❌ 警告: IK 解が算出できませんでした。")
+                        CURRENT_GRASP_TCP_MARKERS = None
                     else:
-                        print(f"✅ IK 解決成功! (進入ピッチ角: {adopted_pitch:.1f}°, 手首ロール ID5: {math.degrees(ik_grasp[5]):.1f}°)")
+                        print(f"✅ IK 解決成功! (進入ピッチ: {adopted_pitch:.1f}°, 手首ロール ID5: {math.degrees(ik_grasp[5]):.1f}°)")
+                        print(f"   推計沈み込み量: {sag_offset_m * 1000:.1f} mm")
 
-                        # 1. 上空アプローチ
+                    # [1] 上空アプローチ
                         print("▶️ [1/3] 上空アプローチ中...")
                         ik_wp[6] = GRIPPER_OPEN_RAD
-                        interpolate_motion(sim, ik_wp, steps=35)
-                        time.sleep(0.4)
+                        interpolate_motion(sim, ik_wp, steps=35, projector=projector)
+                        time.sleep(0.3)
 
-                        # 2. 把持位置へ降下
+                        # [2] 把持位置へ降下
                         print("▶️ [2/3] 把持位置へ降下中...")
                         ik_grasp[6] = GRIPPER_OPEN_RAD
-                        interpolate_motion(sim, ik_grasp, steps=25)
-                        time.sleep(0.5)
+                        interpolate_motion(sim, ik_grasp, steps=25, projector=projector)
+                        time.sleep(0.6)
 
-                        # 3. 把持 (爪を閉じる)
+                        # [3] 爪を閉じる
                         print("▶️ [3/3] 爪を閉じて把持中...")
                         ik_grasp_closed = dict(ik_grasp)
                         ik_grasp_closed[6] = GRIPPER_CLOSE_RAD
-                        interpolate_motion(sim, ik_grasp_closed, steps=15)
-                        time.sleep(0.6)
+                        interpolate_motion(sim, ik_grasp_closed, steps=15, projector=projector)
+                        time.sleep(0.8)
 
-                        # 4. 持ち上げ退避
+                        # [4] 持ち上げ退避
                         print("▶️ 持ち上げ退避中...")
                         ik_wp_closed = dict(ik_wp)
                         ik_wp_closed[6] = GRIPPER_CLOSE_RAD
-                        interpolate_motion(sim, ik_wp_closed, steps=25)
-                        time.sleep(0.5)
+                        interpolate_motion(sim, ik_wp_closed, steps=25, projector=projector)
 
-                        print("✨ 把持シーケンス完了。[H] キーでホームに戻せます。")
+                        print("✨ 把持シーケンス完了。[H] キーでホームに戻すとマーカーが消えます。")
                 else:
                     print(f"⚠️ 指定されたインデックス #{SELECTED_TARGET_IDX} の物体が見つかりません。")
 
