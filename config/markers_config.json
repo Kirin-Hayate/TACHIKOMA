@@ -1,23 +1,23 @@
 {
   "markers": {
     "0": {
-      "r_cm": 61.27,
-      "theta_deg": -29.19,
+      "r_cm": 67.37,
+      "theta_deg": -33.78,
       "description": "奥・左"
     },
     "1": {
-      "r_cm": 56.69,
-      "theta_deg": 16.0,
+      "r_cm": 56.82,
+      "theta_deg": 6.1,
       "description": "奥・右"
     },
     "2": {
-      "r_cm": 31.99,
-      "theta_deg": -65.04,
+      "r_cm": 40.31,
+      "theta_deg": -66.61,
       "description": "手前・左"
     },
     "3": {
-      "r_cm": 21.97,
-      "theta_deg": 48.69,
+      "r_cm": 17.73,
+      "theta_deg": 21.5,
       "description": "手前・右"
     }
   },

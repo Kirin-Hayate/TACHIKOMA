@@ -77,7 +77,7 @@ MIN_APPROACH_DEG = 5.0      # 許容する最小進入角 (5°: 斜めアプロ�
 
 # SO-ARM100 非対称爪補正定数 [m]
 # 固定爪を物体外縁から逃がすためのローカル側方偏心マージン (実機の構造に合わせて微調整)
-GRIPPER_ASYM_OFFSET_M = 0.012  # 約 12mm 
+GRIPPER_ASYM_OFFSET_M = 0.022
 
 
 # ==============================================================================
@@ -342,7 +342,6 @@ x_phys_mm: float,
     # --------------------------------------------------------------------------
     # 2. 手首ロール角 (ID 5) のアライメント算出 (実測反転モデル)
     # --------------------------------------------------------------------------
-    # 幾何学的関係: wrist_roll は -(obj_angle - base_theta) に追従
     rel_roll_deg_1 = -(angle_deg - base_theta_deg)
     
     # 180° 対称性の正規化 (-90° 〜 +90°)
@@ -354,18 +353,18 @@ x_phys_mm: float,
     # 180° 反対向き候補
     rel_roll_deg_2 = rel_roll_deg_1 + 180.0 if rel_roll_deg_1 < 0 else rel_roll_deg_1 - 180.0
 
-    # 原点 (0 rad / Raw≈3072) からの変位が小さく、可動域に余裕がある方を rel_roll_deg として確定
+    # 👉 変更: 可動爪が物体側を向き、固定爪が外へ逃げるよう 180° 反対側の候補を採用
     if abs(rel_roll_deg_1) <= abs(rel_roll_deg_2):
-        rel_roll_deg = rel_roll_deg_1
-    else:
         rel_roll_deg = rel_roll_deg_2
+    else:
+        rel_roll_deg = rel_roll_deg_1
 
     wrist_roll_rad = math.radians(rel_roll_deg)
 
     # --------------------------------------------------------------------------
     # 3. 非対称爪（固定爪干渉回避）の目標点補正
     # --------------------------------------------------------------------------
-    asym_shift_m = min(0.015, GRIPPER_ASYM_OFFSET_M + (min(25.0, obj_thickness_mm) / 2000.0))
+    asym_shift_m = min(0.030, GRIPPER_ASYM_OFFSET_M + (min(25.0, obj_thickness_mm) / 2000.0))
     global_yaw_rad = math.radians(base_theta_deg + rel_roll_deg)
     shift_dx_m = -asym_shift_m * math.sin(global_yaw_rad)
     shift_dy_m = asym_shift_m * math.cos(global_yaw_rad)
@@ -443,5 +442,70 @@ x_phys_mm: float,
         print("   🔍 【IK 探索失敗トレース】:")
         for log in failure_logs:
             print(f"      ✖ {log}")
+
+    return None, None, None
+
+# ==============================================================================
+# 互換ラッパー (auto_calibrate_workspace.py 等の旧ツール用)
+# ==============================================================================
+def solve_ik_adaptive_approach(
+    r_tcp: float,
+    theta_deg: float,
+    z_tcp: float,
+    gripper_rad: float = GRIPPER_CLOSE_RAD,
+    wrist_roll_rad: float = WRIST_ROLL_HORIZONTAL_RAD,
+    enable_sag_compensation: bool = True
+) -> Tuple[Optional[Dict[int, float]], Optional[Dict[int, float]], Optional[float]]:
+    """
+    極座標 (r_tcp [m], theta_deg [deg], z_tcp [m]) から進入可能なピッチ角を探索し、
+    目標姿勢と上空待機姿勢のペアを算出する (旧 API 互換用)。
+    """
+    theta_rad = math.radians(theta_deg)
+    
+    if enable_sag_compensation:
+        sag_offset = calculate_sag_compensation(r_tcp, theta_rad)
+        effective_z = z_tcp + sag_offset
+    else:
+        effective_z = z_tcp
+
+    candidate_pitches = [80.0, 60.0, 40.0, 20.0]
+
+    for pitch_deg in candidate_pitches:
+        pitch_rad = math.radians(pitch_deg)
+        r_wrist_target = r_tcp - L_GRIPPER * math.cos(pitch_rad)
+        z_wrist_target = effective_z + L_GRIPPER * math.sin(pitch_rad)
+
+        ik_target, _ = solve_ik_wrist_and_pitch(
+            r_wrist=r_wrist_target,
+            theta_deg=theta_deg,
+            z_wrist=z_wrist_target,
+            target_pitch_deg=pitch_deg,
+            gripper_rad=gripper_rad,
+            wrist_roll_rad=wrist_roll_rad,
+            return_reason=True
+        )
+
+        if ik_target is None:
+            continue
+
+        warm_start_qpos = np.array([ik_target[sid] for sid in range(1, 7)])
+        r_wrist_wp = r_wrist_target
+        z_wrist_wp = z_wrist_target + DELTA_Z_WRIST_WP
+
+        ik_wp, _ = solve_ik_wrist_and_pitch(
+            r_wrist=r_wrist_wp,
+            theta_deg=theta_deg,
+            z_wrist=z_wrist_wp,
+            target_pitch_deg=pitch_deg,
+            gripper_rad=gripper_rad,
+            wrist_roll_rad=wrist_roll_rad,
+            init_qpos_custom=warm_start_qpos,
+            return_reason=True
+        )
+
+        if ik_wp is None:
+            continue
+
+        return ik_target, ik_wp, float(pitch_deg)
 
     return None, None, None
