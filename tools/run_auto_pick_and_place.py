@@ -339,23 +339,43 @@ def main():
                                 is_grasped = False  # 安全のため読み取り失敗時も空振りとみなしてリトライへ
 
                         if is_grasped:
-                            # 👉 成功時: 失敗履歴を削除
+                            # --------------------------------------------------
+                            # 1. 把持成功: Place エリアへ搬送 ➔ Home 復帰
+                            # --------------------------------------------------
                             OBJECT_FAIL_HISTORY.pop(obj_key, None)
                             executor.move_to_rad(place_wp_close, duration_sec=1.5, send_to_real=True)
                             executor.move_to_rad(place_land_close, duration_sec=0.8, send_to_real=True)
                             executor.move_to_rad(place_land_open, duration_sec=0.5, send_to_real=True)
                             executor.move_to_rad(place_wp_open, duration_sec=0.8, send_to_real=True)
                             print("✨ 配置完了！")
-                        else:
-                            # 👉 失敗時: 失敗カウントをインクリメント
-                            OBJECT_FAIL_HISTORY[obj_key] = fail_count + 1
-                            print(f"⚠️ 把持空振りを検知 (失敗回数: {OBJECT_FAIL_HISTORY[obj_key]}/{MAX_RETRIES_PER_OBJECT})")
-                            if OBJECT_FAIL_HISTORY[obj_key] >= MAX_RETRIES_PER_OBJECT:
-                                print("🛑 上限に達したため、この物体を一時スキップして次を優先します。")
 
-                        executor.move_to_home_and_wait(home_rad)
-                        time.sleep(0.5)
-                        state = "IDLE"
+                            # 配置後は Home へ戻って次の物体探索へ
+                            executor.move_to_home_and_wait(home_rad)
+                            time.sleep(0.3)
+                            state = "IDLE"
+
+                        else:
+                            # --------------------------------------------------
+                            # 2. 把持失敗 (空振り): 上空で爪を開き、即時再トライ
+                            # --------------------------------------------------
+                            new_fail_count = fail_count + 1
+                            OBJECT_FAIL_HISTORY[obj_key] = new_fail_count
+                            print(f"⚠️️ 把持空振りを検知 (試行 {new_fail_count}/{MAX_RETRIES_PER_OBJECT})")
+
+                            # 上空待機姿勢のまま、爪を静かに開く (0.4秒)
+                            executor.move_to_rad(pick_wp_open, duration_sec=0.4, send_to_real=True)
+
+                            if new_fail_count < MAX_RETRIES_PER_OBJECT:
+                                # 👉 【Home をスキップ】その場の上空から直ちに再トライ
+                                print("⚡ Home を経由せず、上空から即座にオフセット摂動をかけて再試行します...")
+                                time.sleep(0.2)
+                                state = "PLAN_AND_EXECUTE"  # 再度プラン＆実行へ直結
+                            else:
+                                # 規定回数連続で失敗した場合のみ、Home へ戻ってスキップ
+                                print("🛑 連続失敗上限に達しました。Home へ戻り、別の物体へ切り替えます。")
+                                executor.move_to_home_and_wait(home_rad)
+                                time.sleep(0.5)
+                                state = "IDLE"
 
             # 画面ステータス表示
             status_text = f"State: {state} | Objs: {len(detected_objs)} | [SPACE] Pause/Resume"
