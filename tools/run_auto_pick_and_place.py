@@ -76,7 +76,7 @@ OBJECT_FAIL_HISTORY: Dict[str, int] = {}  # 物体座標キーごとの失敗カ
 # 爪完全閉止時の実測値: 1889
 GRIPPER_CLOSED_RAW = 1889
 # 閉止位置からこのカウント幅以内なら「空振り」と判定 (約 50〜70 カウント)
-EMPTY_GRASP_TOLERANCE_RAW = 60
+EMPTY_GRASP_TOLERANCE_RAW = 30
 
 MAX_SLOTS = 16
 DEFAULT_OBJ_HEIGHT_M = 0.015
