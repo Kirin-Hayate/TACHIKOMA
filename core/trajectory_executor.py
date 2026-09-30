@@ -105,16 +105,16 @@ class TrajectoryExecutor:
                 return False
         return True
 
-    def move_to_home_and_wait(self, home_rad: Dict[int, float], timeout: float = 4.0):
+    def move_to_home_and_wait(self, home_rad: Dict[int, float], timeout: float = 5.0):
         """
-        auto_calibrate_workspace_2.py の確証ロジックに基づく 2段階安全 Home 復帰
-        1. 手首ピッチ (ID 4) を先行引き上げ
-        2. 全軸を Home 姿勢へ移動
-        3. サーボ物理到達の監視
+        実機を安全に Home 姿勢へ復帰させる確証 2 段階シーケンス
+        1. 手首ピッチ (ID 4) を先行して上向きに引き上げる
+        2. 全軸を Home 姿勢へスムーズに移動
+        3. サーボ物理位置を読み取り、到達完了まで待機
         """
-        print("🏠 Home 姿勢へ移動中...")
+        print("🏠 Home 姿勢へ復帰中...")
 
-        # 現在の実機姿勢を読み取り (取得できない場合は sim または home_rad をフォールバック)
+        # 実機の現在の生角度を読み出し (読み取れない場合は sim の値でフォールバック)
         current_rad = {}
         if self.is_real_connected and hasattr(self.controller, 'driver') and self.controller.driver:
             for sid in range(1, 7):
@@ -127,20 +127,20 @@ class TrajectoryExecutor:
             current_rad = {sid: float(self.sim.data.qpos[sid - 1]) if self.sim else home_rad[sid] for sid in range(1, 7)}
 
         # ----------------------------------------------------------------------
-        # ステップ 1: まず ID 4 (手首ピッチ) を上向きに逃がす (所要 1.0秒)
-        # (机面との擦れや無理なトルクを防ぎ、ID4 の戻り遅れ・脱調を解消)
+        # ステップ 1: 手首ピッチ (ID 4) を先行引き上げ (負荷軽減)
         # ----------------------------------------------------------------------
         stage1_rad = dict(current_rad)
         stage1_rad[4] = home_rad[4]
         self.move_to_rad(stage1_rad, duration_sec=1.0, steps=20, send_to_real=True)
+        time.sleep(0.1)
 
         # ----------------------------------------------------------------------
-        # ステップ 2: 全軸を Home 姿勢へ補間移動 (余裕を持たせて 2.0秒)
+        # ステップ 2: 全軸を直立 Home 姿勢へ移動
         # ----------------------------------------------------------------------
-        self.move_to_rad(home_rad, duration_sec=2.0, steps=35, send_to_real=True)
+        self.move_to_rad(home_rad, duration_sec=2.2, steps=35, send_to_real=True)
 
         # ----------------------------------------------------------------------
-        # ステップ 3: サーボの物理到達を監視 (auto_calibrate_workspace_2.py 準拠)
+        # ステップ 3: 実機サーボの物理到達を監視
         # ----------------------------------------------------------------------
         if self.is_real_connected and hasattr(self.controller, 'driver') and self.controller.driver:
             start_t = time.time()
@@ -150,7 +150,6 @@ class TrajectoryExecutor:
                     pos = self.controller.driver.read_position(sid)
                     if pos is not None:
                         cur_angle = raw_to_radian(sid, pos)
-                        # 自重による負荷がかかる ID4 は許容誤差を 0.15 rad (約8.5度) に設定
                         threshold = 0.15 if sid == 4 else 0.08
                         if abs(cur_angle - home_rad[sid]) > threshold:
                             all_reached = False
@@ -158,6 +157,6 @@ class TrajectoryExecutor:
                 if all_reached:
                     break
                 time.sleep(0.05)
-            time.sleep(0.3)  # 静止安定化マージン
+            time.sleep(0.2)
 
         print("✅ Home 姿勢への復帰が完了しました。")

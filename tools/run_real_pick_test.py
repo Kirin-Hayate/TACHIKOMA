@@ -47,8 +47,8 @@ except ImportError:
 # --------------------------------------------------------------------------
 # 実験用：把持目標位置の微調整オフセット (単位: mm)
 # --------------------------------------------------------------------------
-MANUAL_OFFSET_MAJOR_MM = -15.0   # 長い辺に沿ったオフセット (+で一方へ, -で逆へ)
-MANUAL_OFFSET_MINOR_MM = -50.0   # 短い辺(厚み)に沿ったオフセット (+で外側へ, -で物体寄りへ)
+MANUAL_OFFSET_MAJOR_MM = -15.0   # 長い辺に沿ったオフセット
+MANUAL_OFFSET_MINOR_MM = -50.0   # 短い辺(厚み)に沿ったオフセット
 
 MAX_SLOTS = 16
 DEFAULT_OBJ_HEIGHT_M = 0.015
@@ -148,7 +148,7 @@ def main():
     print("  [Q/ESC]  : 終了")
     print("--------------------------------------------------")
 
-    # 1. 実機コントローラ初期化 (接続を試行)
+    # 1. 実機コントローラ初期化
     controller = None
     if HAS_HARDWARE_MODULE:
         try:
@@ -175,10 +175,10 @@ def main():
 
     executor = TrajectoryExecutor(sim=sim, servo_controller=controller)
 
-    # 実機接続時は実機をまずホーム姿勢へ
+    # 実機接続時は安全復帰ルーチンで初期化
     if executor.is_real_connected:
         print("🤖 実機をホーム姿勢へ初期化中...")
-        executor.move_to_home_and_wait(home_rad)  # 👉 move_to_home_and_wait に変更
+        executor.move_to_home_and_wait(home_rad)
 
     # スロット初期化
     slot_info = []
@@ -248,16 +248,7 @@ def main():
             if REQ_GO_HOME:
                 REQ_GO_HOME = False
                 CURRENT_GRASP_TCP_MARKERS = None
-                executor.move_to_home_and_wait(home_rad)  # 👉 統一
-
-            # [P] 実機シーケンス終了後のホーム復帰
-                if confirm == 'y':
-                    print("🦾 実機把持シーケンスを開始します...")
-                    executor.execute_waypoints(pick_sequence, send_to_real=True)
-                    time.sleep(0.8)
-                    # 👉 到達監視＆ID4先行引き上げ付きで Home 復帰
-                    executor.move_to_home_and_wait(home_rad)
-                    print("✨ 実機把持テストが完了しました！")
+                executor.move_to_home_and_wait(home_rad)
 
             # [P] 把持プレビュー ＆ 実機実行確認
             if REQ_PREVIEW:
@@ -291,8 +282,8 @@ def main():
                         obj_thickness_mm=minor_mm,
                         gripper_open_rad=GRIPPER_OPEN_RAD,
                         enable_sag_compensation=True,
-                        offset_major_mm=MANUAL_OFFSET_MAJOR_MM,  # 👉 パラメータ渡し
-                        offset_minor_mm=MANUAL_OFFSET_MINOR_MM   # 👉 パラメータ渡し
+                        offset_major_mm=MANUAL_OFFSET_MAJOR_MM,
+                        offset_minor_mm=MANUAL_OFFSET_MINOR_MM
                     )
 
                     if ik_grasp is None or ik_wp is None:
@@ -313,21 +304,20 @@ def main():
                             (ik_wp_close, 0.8, "物体を持ち上げ退避")
                         ]
 
-                        # 👉 【変更点 2】 プレビュー時は send_to_real=False で MuJoCo だけ動かす
+                        # 1. プレビュー再生
                         print("\n🎬 [シミュレーション] プレビュー再生中...")
                         executor.execute_waypoints(pick_sequence, send_to_real=False)
 
-                        # 実機実行ゲート
+                        # 2. 実機実行ゲート
                         if executor.is_real_connected:
                             print("\n" + "!" * 55)
                             confirm = input("⚠️ 実機サーボでこの動作を実行しますか？ (y/N): ").strip().lower()
                             if confirm == 'y':
                                 print("🦾 実機把持シーケンスを開始します...")
-                                # 👉 本番実行時のみ send_to_real=True で実機を動かす
                                 executor.execute_waypoints(pick_sequence, send_to_real=True)
-                                time.sleep(1.0)
-                                print("🏠 実機をホーム姿勢へ戻します...")
-                                executor.move_to_rad(home_rad, duration_sec=5.0, send_to_real=True)
+                                time.sleep(0.8)
+                                # 👉 【修正】到達監視＆ID4先行引き上げ付きで安全に Home 復帰
+                                executor.move_to_home_and_wait(home_rad)
                                 print("✨ 実機把持テストが完了しました！")
                             else:
                                 print("🛡️ 実機実行をキャンセルしました。")
