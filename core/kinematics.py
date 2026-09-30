@@ -530,3 +530,86 @@ def solve_ik_adaptive_approach(
         return ik_target, ik_wp, float(pitch_deg)
 
     return None, None, None
+
+# ==============================================================================
+# 6. 配置 (Place) 専用 IK 計算レイヤー
+# ==============================================================================
+def solve_ik_tabletop_place(
+    x_phys_mm: float,
+    y_phys_mm: float,
+    z_phys_mm: float = 12.0,
+    place_angle_deg: float = 0.0,
+    enable_sag_compensation: bool = True,
+    verbose: bool = True
+) -> Tuple[Optional[Dict[int, float]], Optional[Dict[int, float]], Optional[float]]:
+    """
+    指定された机上目標座標 (X, Y, Z [mm]) および配置方位角 (deg) から、
+    物体を静かに置くための接地姿勢 (target) と上空進入姿勢 (waypoint) を算出する。
+    """
+    p_place = np.array([x_phys_mm / 1000.0, y_phys_mm / 1000.0])
+    r_place = np.linalg.norm(p_place)
+    base_theta_rad = math.atan2(p_place[1], p_place[0])
+    base_theta_deg = math.degrees(base_theta_rad)
+
+    # 手首ロール角 (ID 5) の計算
+    rel_roll_1 = -(place_angle_deg - base_theta_deg)
+    while rel_roll_1 > 90.0:
+        rel_roll_1 -= 180.0
+    while rel_roll_1 <= -90.0:
+        rel_roll_1 += 180.0
+
+    rel_roll_2 = rel_roll_1 + 180.0 if rel_roll_1 < 0 else rel_roll_1 - 180.0
+    chosen_rel_roll = rel_roll_2 if abs(rel_roll_2) < abs(rel_roll_1) else rel_roll_1
+    wrist_roll_rad = math.radians(chosen_rel_roll)
+
+    corr_z_m = z_phys_mm / 1000.0
+    if enable_sag_compensation:
+        sag_offset = calculate_sag_compensation(r_place, base_theta_rad)
+        effective_z = corr_z_m + sag_offset
+    else:
+        effective_z = corr_z_m
+
+    candidate_pitches = [80.0, 60.0, 40.0, 20.0, 10.0]
+
+    for pitch_deg in candidate_pitches:
+        pitch_rad = math.radians(pitch_deg)
+        r_wrist_target = r_place - L_GRIPPER * math.cos(pitch_rad)
+        z_wrist_target = effective_z + L_GRIPPER * math.sin(pitch_rad)
+
+        # 接地目標点 (爪は閉じたまま降下)
+        ik_target, _ = solve_ik_wrist_and_pitch(
+            r_wrist=r_wrist_target,
+            theta_deg=base_theta_deg,
+            z_wrist=z_wrist_target,
+            target_pitch_deg=pitch_deg,
+            gripper_rad=GRIPPER_CLOSE_RAD,
+            wrist_roll_rad=wrist_roll_rad,
+            return_reason=True
+        )
+        if ik_target is None:
+            continue
+
+        # 上空進入点
+        warm_start_qpos = np.array([ik_target[sid] for sid in range(1, 7)])
+        r_wrist_wp = r_wrist_target
+        z_wrist_wp = z_wrist_target + DELTA_Z_WRIST_WP
+
+        ik_wp, _ = solve_ik_wrist_and_pitch(
+            r_wrist=r_wrist_wp,
+            theta_deg=base_theta_deg,
+            z_wrist=z_wrist_wp,
+            target_pitch_deg=pitch_deg,
+            gripper_rad=GRIPPER_CLOSE_RAD,
+            wrist_roll_rad=wrist_roll_rad,
+            init_qpos_custom=warm_start_qpos,
+            return_reason=True
+        )
+        if ik_wp is None:
+            continue
+
+        if verbose:
+            print(f"   [Place 計画成立] 目標: ({x_phys_mm:.1f}, {y_phys_mm:.1f}, {z_phys_mm:.1f}) mm | ピッチ: {pitch_deg:.1f}°")
+
+        return ik_target, ik_wp, float(pitch_deg)
+
+    return None, None, None

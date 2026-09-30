@@ -1,14 +1,34 @@
 """
 ==============================================================================
-実機把持テスト ＆ プレビュー実行ツール
+実機 Pick & Place 統合テスト ＆ プレビュー実行ツール
 (tools/run_real_pick_test.py)
 ==============================================================================
+【役割と概要】
+机上の物体をビジョン検知し、非対称爪の着地モデル・物理たわみ補正・S字加減速軌道を
+用いて安全に「把持 (Pick)」➔「指定エリアへの搬送・静置 (Place)」➔「Home復帰」
+を行う統合テストスクリプトです。
+
+【主な機能】
+1. デュアル実行モード:
+   - [P] キーにより、まずは MuJoCo 物理シミュレータ上で完全な Pick & Place 軌道をプレビュー。
+   - プレビュー確認後、コンソールで 'y' を入力することで、実機サーボへ同一軌道を安全に送信。
+2. 固定爪着地モデル ＆ 手動オフセット調整:
+   - 物体外縁から逃げた位置へ固定爪を先行着地させ、可動爪で抱え込む非対称把持。
+   - 長手・短手の任意オフセット（MANUAL_OFFSET_MAJOR_MM / MINOR_MM）に対応。
+3. 2段階安全 Home 復帰シーケンス:
+   - 把持・解放後、手首ピッチ (ID 4) を先行引き上げして自重負荷を逃がし、
+     実機サーボの物理到達を監視して確実に直立姿勢へ復帰。
+
 【操作フロー】
-1. カメラから物体を認識し、MuJoCo 上に実寸直方体・ArUco・把持マーカーを同期。
-2. [0]〜[9] で把持対象を選択。
-3. [P] キーを押すと、MuJoCo 上で一連の動作 (上空 ➔ 把持 ➔ 持ち上げ) をプレビュー。
-4. プレビュー後、ターミナルで `y` を入力すると、実機サーボが同一の軌道で物体を持ち上げます。
-5. [H] でホーム姿勢へ復帰。
+1. カメラ画像から机上の物体を検知し、MuJoCo 上に実寸直方体・ArUco・把持マーカーを同期。
+2. [0]〜[9] キーで把持対象の物体を選択。
+3. [P] キーを押して、MuJoCo 上で一連の動作
+   (Pick上空 ➔ 把持 ➔ 持ち上げ ➔ Place上空へ旋回 ➔ 机上接地 ➔ 解放 ➔ 垂直退避 ➔ Home復帰)
+   をプレビュー再生。
+4. ターミナルで `y` を入力すると、実機サーボが同一の軌道で物体を把持・配置・復帰。
+5. [H] キーで任意のタイミングで実機およびシミュレータを安全に Home 姿勢へ復帰。
+6. [B] キーで背景差分を更新（照明変化や空机の基準更新）。
+7. [Q] または [ESC] で安全にトルクを管理して終了。
 ==============================================================================
 """
 
@@ -61,6 +81,15 @@ REQ_SAVE_BG = False
 REQ_QUIT = False
 
 CURRENT_GRASP_TCP_MARKERS: Optional[Dict[str, np.ndarray]] = None
+
+# --------------------------------------------------------------------------
+# 配置 (Place) エリア設定 (机上右側の安全領域)
+# --------------------------------------------------------------------------
+PLACE_X_MM = 180.0        # ロボット基準前方 (mm)
+PLACE_Y_MM = 160.0        # ロボット基準右方向 (mm)
+PLACE_Z_MM = 20.0         # 接地解放高度 (机面 ~~mm)
+PLACE_ANGLE_DEG = 0.0     # 配置時の姿勢角
+
 
 
 def sim_key_callback(keycode: int):
@@ -138,12 +167,12 @@ def main():
     global CURRENT_GRASP_TCP_MARKERS
 
     print("==================================================")
-    print(" 🦾 SO-ARM100 実機把持 (Pick) 統合テスト")
+    print(" TACHIKOMA 自律 Pick & Place 統合テスト")
     print("==================================================")
     print("【操作】")
     print("  [0]〜[9] : 把持対象物体の選択")
-    print("  [P]      : 選択対象への把持シーケンスをプレビュー")
-    print("  [H]      : ホーム姿勢に戻す")
+    print("  [P]      : 選択対象の Pick & Place シーケンスをプレビュー")
+    print("  [H]      : 2段階安全シーケンスでホーム姿勢に復帰")
     print("  [B]      : 背景差分更新")
     print("  [Q/ESC]  : 終了")
     print("--------------------------------------------------")
@@ -201,8 +230,13 @@ def main():
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
 
+    # 👉 修正: カメラ露光と映像ストリームを安定させるウォームアップ空読み
+    for _ in range(5):
+        cap.read()
+        time.sleep(0.04)
+
     detector = TabletopDetector(projector)
-    cv2.namedWindow("Real Pick Vision Tracker")
+    cv2.namedWindow("Real Pick Vision Tracker", cv2.WINDOW_AUTOSIZE)
 
     try:
         while sim.is_running() and not REQ_QUIT:
@@ -215,6 +249,22 @@ def main():
 
             warped = projector.warp_to_topdown(frame, out_w=500, out_h=500)
             if warped is None:
+                # 👉 修正: ウィンドウの応答なし(フリーズ)を防ぐため、代替画面を描画して waitKey を必ず通す
+                fallback_disp = cv2.resize(frame, (500, 500))
+                cv2.putText(
+                    fallback_disp,
+                    "Searching ArUco Markers...",
+                    (30, 250),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (0, 0, 255),
+                    2,
+                    cv2.LINE_AA
+                )
+                cv2.imshow("Real Pick Vision Tracker", fallback_disp)
+                key = cv2.waitKey(1) & 0xFF
+                if key in [ord('q'), ord('Q'), 27]:
+                    break
                 continue
 
             if REQ_SAVE_BG:
@@ -250,7 +300,7 @@ def main():
                 CURRENT_GRASP_TCP_MARKERS = None
                 executor.move_to_home_and_wait(home_rad)
 
-            # [P] 把持プレビュー ＆ 実機実行確認
+            # [P] 把持 & 配置 (Pick & Place) プレビュー ＆ 実機実行確認
             if REQ_PREVIEW:
                 REQ_PREVIEW = False
                 if SELECTED_TARGET_IDX < len(detected_objs):
@@ -260,21 +310,14 @@ def main():
                     angle_deg = target_obj["angle_deg"]
 
                     print("\n" + "=" * 55)
-                    print(f"🎯 ターゲット #{SELECTED_TARGET_IDX} の把持計画を計算:")
-                    print(f"   位置: X={x_mm:.1f}mm, Y={y_mm:.1f}mm | 傾き: {angle_deg:+.1f}°")
+                    print(f"🎯 ターゲット #{SELECTED_TARGET_IDX} の Pick & Place 計画を計算:")
+                    print(f"   [Pick]  位置: X={x_mm:.1f}mm, Y={y_mm:.1f}mm | 傾き: {angle_deg:+.1f}°")
+                    print(f"   [Place] 目標: X={PLACE_X_MM:.1f}mm, Y={PLACE_Y_MM:.1f}mm, Z={PLACE_Z_MM:.1f}mm")
 
                     z_grasp_mm = 2.0
 
-                    r_phys_m = math.hypot(x_mm, y_mm) / 1000.0
-                    theta_phys_rad = math.atan2(y_mm, x_mm)
-                    sag_offset_m = calculate_sag_compensation(r_phys_m, theta_phys_rad)
-
-                    CURRENT_GRASP_TCP_MARKERS = {
-                        "target_tcp": np.array([-y_mm / 1000.0, -x_mm / 1000.0, z_grasp_mm / 1000.0]),
-                        "sag_tcp": np.array([-y_mm / 1000.0, -x_mm / 1000.0, (z_grasp_mm / 1000.0) - sag_offset_m])
-                    }
-
-                    ik_grasp, ik_wp, adopted_pitch = solve_ik_tabletop_grasp(
+                    # 1. Pick 側の姿勢計算
+                    ik_grasp, ik_pick_wp, adopted_pitch = solve_ik_tabletop_grasp(
                         x_phys_mm=x_mm,
                         y_phys_mm=y_mm,
                         z_phys_mm=z_grasp_mm,
@@ -286,39 +329,62 @@ def main():
                         offset_minor_mm=MANUAL_OFFSET_MINOR_MM
                     )
 
-                    if ik_grasp is None or ik_wp is None:
-                        print("❌ IK 解の算出に失敗しました。")
+                    # 2. Place 側の姿勢計算
+                    from core.kinematics import solve_ik_tabletop_place
+                    ik_place_target, ik_place_wp, _ = solve_ik_tabletop_place(
+                        x_phys_mm=PLACE_X_MM,
+                        y_phys_mm=PLACE_Y_MM,
+                        z_phys_mm=PLACE_Z_MM,
+                        place_angle_deg=PLACE_ANGLE_DEG,
+                        enable_sag_compensation=True
+                    )
+
+                    if ik_grasp is None or ik_pick_wp is None or ik_place_target is None or ik_place_wp is None:
+                        print("❌ Pick または Place の IK 解算出に失敗しました。")
                     else:
-                        print(f"✅ IK 解決成功 (進入ピッチ: {adopted_pitch:.1f}°, 手首ロール: {math.degrees(ik_grasp[5]):.1f}°)")
+                        print(f"✅ IK 解決成功 (Pick進入ピッチ: {adopted_pitch:.1f}°)")
 
-                        # ウェイポイントシーケンス構築
-                        ik_wp_open = dict(ik_wp); ik_wp_open[6] = GRIPPER_OPEN_RAD
-                        ik_grasp_open = dict(ik_grasp); ik_grasp_open[6] = GRIPPER_OPEN_RAD
-                        ik_grasp_close = dict(ik_grasp); ik_grasp_close[6] = GRIPPER_CLOSE_RAD
-                        ik_wp_close = dict(ik_wp); ik_wp_close[6] = GRIPPER_CLOSE_RAD
+                        # ウェイポイント各姿勢の構築
+                        pick_wp_open     = dict(ik_pick_wp);      pick_wp_open[6]     = GRIPPER_OPEN_RAD
+                        pick_grasp_open  = dict(ik_grasp);        pick_grasp_open[6]  = GRIPPER_OPEN_RAD
+                        pick_grasp_close = dict(ik_grasp);        pick_grasp_close[6] = GRIPPER_CLOSE_RAD
+                        pick_wp_close    = dict(ik_pick_wp);      pick_wp_close[6]    = GRIPPER_CLOSE_RAD
 
-                        pick_sequence = [
-                            (ik_wp_open, 1.2, "上空アプローチ"),
-                            (ik_grasp_open, 0.8, "把持点へ降下"),
-                            (ik_grasp_close, 0.5, "爪を閉じて把持"),
-                            (ik_wp_close, 0.8, "物体を持ち上げ退避")
+                        place_wp_close   = dict(ik_place_wp);     place_wp_close[6]   = GRIPPER_CLOSE_RAD
+                        place_land_close = dict(ik_place_target); place_land_close[6] = GRIPPER_CLOSE_RAD
+                        place_land_open  = dict(ik_place_target); place_land_open[6]  = GRIPPER_OPEN_RAD
+                        place_wp_open    = dict(ik_place_wp);     place_wp_open[6]    = GRIPPER_OPEN_RAD
+
+                        # 完全な Pick & Place 軌道シーケンス
+                        pnp_sequence = [
+                            # --- Pick フェーズ ---
+                            (pick_wp_open,     1.2, "Pick上空アプローチ"),
+                            (pick_grasp_open,  0.8, "把持点へ降下"),
+                            (pick_grasp_close, 0.5, "爪を閉じて把持"),
+                            (pick_wp_close,    0.8, "物体を持ち上げ退避"),
+
+                            # --- Place フェーズ ---
+                            (place_wp_close,   1.5, "Place上空へ旋回移動"),
+                            (place_land_close, 0.8, "机上設置高度へ降下"),
+                            (place_land_open,  0.5, "爪を開いて物体を解放"),
+                            (place_wp_open,    0.8, "真上へ垂直退避")
                         ]
 
-                        # 1. プレビュー再生
-                        print("\n🎬 [シミュレーション] プレビュー再生中...")
-                        executor.execute_waypoints(pick_sequence, send_to_real=False)
+                        # 1. MuJoCo 上でプレビュー再生
+                        print("\n🎬 [シミュレーション] Pick & Place プレビュー再生中...")
+                        executor.execute_waypoints(pnp_sequence, send_to_real=False)
 
                         # 2. 実機実行ゲート
                         if executor.is_real_connected:
                             print("\n" + "!" * 55)
-                            confirm = input("⚠️ 実機サーボでこの動作を実行しますか？ (y/N): ").strip().lower()
+                            confirm = input("⚠️ 実機サーボでこの Pick & Place を実行しますか？ (y/N): ").strip().lower()
                             if confirm == 'y':
-                                print("🦾 実機把持シーケンスを開始します...")
-                                executor.execute_waypoints(pick_sequence, send_to_real=True)
-                                time.sleep(0.8)
-                                # 👉 【修正】到達監視＆ID4先行引き上げ付きで安全に Home 復帰
+                                print("🦾 実機 Pick & Place シーケンスを開始します...")
+                                executor.execute_waypoints(pnp_sequence, send_to_real=True)
+                                time.sleep(0.5)
+                                # 確立済みの安全 2段階 Home 復帰
                                 executor.move_to_home_and_wait(home_rad)
-                                print("✨ 実機把持テストが完了しました！")
+                                print("✨ Pick & Place 動作が正常に完了しました！")
                             else:
                                 print("🛡️ 実機実行をキャンセルしました。")
                         else:
