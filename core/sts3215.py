@@ -39,34 +39,34 @@ class STS3215Driver:
         self.ser.reset_input_buffer()
         self.ser.reset_output_buffer()
 
-    def read_position(self, servo_id):
+    def read_position(self, servo_id, retries=3):
         """
-        指定したサーボ ID から現在の角度生値 (0〜4095) を読み取る
-        - 戻り値: 正常時は 0〜4095 の整数値、失敗時は None
+        指定したサーボ ID から現在の角度生値 (0〜4095) を読み取る (リトライ・バッファクリア対応)
         """
         addr = 0x38     # 現在位置レジスタの先頭アドレス
-        read_len = 2     # 読み取るバイト数 (位置は2バイト: Low, High)
-        length = 4       # パケット長 (命令コード + アドレス + 読取長 + チェックサム = 4)
+        read_len = 2     # 読み取るバイト数
+        length = 4       # パケット長
         
-        # チェックサム計算 (プロトコルの仕様: ~(ID + Length + Instruction + Param...) & 0xFF)
         checksum = ~(servo_id + length + 0x02 + addr + read_len) & 0xFF
-        
-        # 送信パケットの作成 (0xFF 0xFF はヘッダー, 0x02 は READ 命令)
         packet = bytes([0xFF, 0xFF, servo_id, length, 0x02, addr, read_len, checksum])
-        
-        self.ser.write(packet)
-        time.sleep(0.001)
-        response = self.ser.read(8)
-        
-        # 受信データの解析 (8バイト中、5番目と6番目が位置データ)
-        if len(response) >= 7 and response[2] == servo_id:
-            pos = response[5] | (response[6] << 8)
-            if 0 <= pos <= 4095:
-                # 物理実機から読み取った最新の正確な角度で基準位置を同期
-                self.last_positions[servo_id] = pos
-                return pos
-        return None
 
+        for _ in range(retries):
+            # 送信前に受信バッファに残っているゴミを必ず破棄
+            self.ser.reset_input_buffer()
+            self.ser.write(packet)
+            
+            # サーボ側の応答生成待ち (2ms〜3ms)
+            time.sleep(0.003)
+            response = self.ser.read(8)
+
+            if len(response) >= 7 and response[0] == 0xFF and response[1] == 0xFF and response[2] == servo_id:
+                pos = response[5] | (response[6] << 8)
+                if 0 <= pos <= 4095:
+                    self.last_positions[servo_id] = pos
+                    return pos
+            time.sleep(0.005)
+
+        return None
     def write_position(self, servo_id, pos):
         """
         指定したサーボ ID へ目標角度 (0〜4095) を書き込む

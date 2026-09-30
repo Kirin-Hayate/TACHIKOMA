@@ -21,6 +21,7 @@ import sys
 import os
 import time
 import math
+import random
 import cv2
 import numpy as np
 import mujoco
@@ -64,9 +65,18 @@ PLACE_ANGLE_DEG = 0.0            # 配置姿勢角
 
 PICK_Z_MM = 2.0                  # 把持高度 (机面 +2mm)
 
+PICK_Z_MM = 2.0                  # 把持高度 (机面 +2mm)
+
+# 👉 【追加】リトライ制御およびブラックリスト設定
+MAX_RETRIES_PER_OBJECT = 3       # 同一物体への最大リトライ回数 (超えたらスキップ)
+OBJECT_FAIL_HISTORY: Dict[str, int] = {}  # 物体座標キーごとの失敗カウント記録
+
 # 空振り判定閾値 (ID 6 の角度が完全に閉じた状態に近い場合は空振りと判定)
-# 完全把持角 (GRIPPER_CLOSE_RAD) に 対して余裕を見る
-EMPTY_GRASP_THRESHOLD_RAD = GRIPPER_CLOSE_RAD + 0.10
+# 👉 【修正】Raw 生値による空振り判定閾値設定
+# 爪完全閉止時の実測値: 1889
+GRIPPER_CLOSED_RAW = 1889
+# 閉止位置からこのカウント幅以内なら「空振り」と判定 (約 50〜70 カウント)
+EMPTY_GRASP_TOLERANCE_RAW = 60
 
 MAX_SLOTS = 16
 DEFAULT_OBJ_HEIGHT_M = 0.015
@@ -96,8 +106,8 @@ def euler_yaw_to_quat(yaw_rad: float) -> np.ndarray:
 
 def select_best_target(detected_objs: List[Dict]) -> Optional[int]:
     """
-    検出された物体の中から、アーム中心に最も近く安全にアプローチできる対象のインデックスを返す
-    (すでに Place エリア周辺にある物体は除外)
+    検出物体から最近傍の対象を選定。
+    配置済みエリア内、および連続失敗上限に達した物体は除外する。
     """
     if not detected_objs:
         return None
@@ -108,8 +118,12 @@ def select_best_target(detected_objs: List[Dict]) -> Optional[int]:
     for i, obj in enumerate(detected_objs):
         x, y = obj["phys_xy"]
         dist_to_place = math.hypot(x - PLACE_X_MM, y - PLACE_Y_MM)
-        # Place エリアから 40mm 以内にあるものは既に配置完了とみなして除外
         if dist_to_place < 40.0:
+            continue
+
+        # 👉 過去に失敗回数上限に達した物体はスキップ
+        obj_key = f"{int(round(x / 30.0))}_{int(round(y / 30.0))}"
+        if OBJECT_FAIL_HISTORY.get(obj_key, 0) >= MAX_RETRIES_PER_OBJECT:
             continue
 
         dist_to_base = math.hypot(x, y)
@@ -230,18 +244,39 @@ def main():
                     x_mm, y_mm = target_obj_cache["phys_xy"]
                     major_mm, minor_mm = target_obj_cache["size_mm"]
                     angle_deg = target_obj_cache["angle_deg"]
+                    obj_key = f"{int(round(x_mm / 30.0))}_{int(round(y_mm / 30.0))}"
+                    fail_count = OBJECT_FAIL_HISTORY.get(obj_key, 0)
+
+                    # 👉 【戦略的リトライ ＆ ランダムジッターの算出】
+                    cur_major = MANUAL_OFFSET_MAJOR_MM
+                    cur_minor = MANUAL_OFFSET_MINOR_MM
+                    cur_z = PICK_Z_MM
+
+                    if fail_count == 1:
+                        # リトライ1回目: 把持高度を深くし、物体側に少し寄せる
+                        cur_z = max(0.0, cur_z - 2.0)
+                        cur_major -= 5.0
+                        print(f"   🔄 [リトライ 1] 深掘りアプローチ (Z: {cur_z:.1f}mm, Minor: {cur_minor:+.1f}mm)")
+                    elif fail_count >= 2:
+                        # リトライ2回目以降: 長手シフト + ランダム摂動 (ジッター)
+                        jitter_major = random.uniform(-6.0, 6.0)
+                        jitter_minor = random.uniform(-4.0, 4.0)
+                        cur_major += (15.0 if fail_count % 2 == 0 else -15.0) + jitter_major
+                        cur_minor += jitter_minor
+                        cur_z = max(0.0, cur_z - 1.5)
+                        print(f"   🔄 [リトライ {fail_count}] 摂動アプローチ (Major: {cur_major:+.1f}mm, Minor: {cur_minor:+.1f}mm, Z: {cur_z:.1f}mm)")
 
                     # 1. Pick 側 IK
                     ik_grasp, ik_pick_wp, _ = solve_ik_tabletop_grasp(
                         x_phys_mm=x_mm,
                         y_phys_mm=y_mm,
-                        z_phys_mm=PICK_Z_MM,
+                        z_phys_mm=cur_z,
                         angle_deg=angle_deg,
                         obj_thickness_mm=minor_mm,
                         gripper_open_rad=GRIPPER_OPEN_RAD,
                         enable_sag_compensation=True,
-                        offset_major_mm=MANUAL_OFFSET_MAJOR_MM,
-                        offset_minor_mm=MANUAL_OFFSET_MINOR_MM,
+                        offset_major_mm=cur_major,
+                        offset_minor_mm=cur_minor,
                         verbose=False
                     )
 
@@ -256,7 +291,8 @@ def main():
                     )
 
                     if ik_grasp is None or ik_pick_wp is None or ik_place_target is None or ik_place_wp is None:
-                        print("⚠️ IK 解が見つかりません。次の物体を再探索します。")
+                        print("⚠️ IK 解が見つかりません。カウントを増やして別物体へ切り替えます。")
+                        OBJECT_FAIL_HISTORY[obj_key] = fail_count + 1
                         state = "IDLE"
                     else:
                         print("🚀 自律 Pick & Place シーケンスを開始...")
@@ -270,33 +306,53 @@ def main():
                         place_land_open  = dict(ik_place_target); place_land_open[6]  = GRIPPER_OPEN_RAD
                         place_wp_open    = dict(ik_place_wp);     place_wp_open[6]    = GRIPPER_OPEN_RAD
 
-                        # Pick フェーズ実行
+                        # Pick 動作
                         executor.move_to_rad(pick_wp_open, duration_sec=1.2, send_to_real=True)
                         executor.move_to_rad(pick_grasp_open, duration_sec=0.8, send_to_real=True)
                         executor.move_to_rad(pick_grasp_close, duration_sec=0.5, send_to_real=True)
                         executor.move_to_rad(pick_wp_close, duration_sec=0.8, send_to_real=True)
 
-                        # 把持成否チェック (ID 6 のサーボ角度を確認)
-                        time.sleep(0.1)
+                        # ------------------------------------------------------
+                        # 👉 把持判定 (安定化待機 ＆ 複数回ポーリング)
+                        # ------------------------------------------------------
+                        time.sleep(0.2)  # 把持後の振動安定化
                         is_grasped = True
+                        
                         if executor.is_real_connected and hasattr(controller, 'driver') and controller.driver:
-                            grip_raw = controller.driver.read_position(6)
+                            grip_raw = None
+                            # 最大 4 回ポーリングして確実に生値を取得
+                            for _ in range(4):
+                                grip_raw = controller.driver.read_position(6)
+                                if grip_raw is not None:
+                                    break
+                                time.sleep(0.05)
+
                             if grip_raw is not None:
-                                grip_rad = raw_to_radian(6, grip_raw)
-                                # 完全に閉じた限界角に近すぎる場合は空振り
-                                if grip_rad <= EMPTY_GRASP_THRESHOLD_RAD:
-                                    print("⚠️ 把持空振りを検知しました。Home へ戻ります。")
+                                raw_diff = abs(grip_raw - GRIPPER_CLOSED_RAW)
+                                print(f"   🔍 [把持判定] 現在爪 Raw: {grip_raw} (完全閉止値 1889 との差: {raw_diff} count)")
+
+                                # 完全閉止近傍 (±60 count 以内) なら空振りと判定
+                                if raw_diff <= EMPTY_GRASP_TOLERANCE_RAW:
                                     is_grasped = False
+                            else:
+                                print("   ⚠️ サーボ ID 6 の位置読み取りに失敗しました (タイムアウト)。")
+                                is_grasped = False  # 安全のため読み取り失敗時も空振りとみなしてリトライへ
 
                         if is_grasped:
-                            # Place フェーズ実行
+                            # 👉 成功時: 失敗履歴を削除
+                            OBJECT_FAIL_HISTORY.pop(obj_key, None)
                             executor.move_to_rad(place_wp_close, duration_sec=1.5, send_to_real=True)
                             executor.move_to_rad(place_land_close, duration_sec=0.8, send_to_real=True)
                             executor.move_to_rad(place_land_open, duration_sec=0.5, send_to_real=True)
                             executor.move_to_rad(place_wp_open, duration_sec=0.8, send_to_real=True)
                             print("✨ 配置完了！")
+                        else:
+                            # 👉 失敗時: 失敗カウントをインクリメント
+                            OBJECT_FAIL_HISTORY[obj_key] = fail_count + 1
+                            print(f"⚠️ 把持空振りを検知 (失敗回数: {OBJECT_FAIL_HISTORY[obj_key]}/{MAX_RETRIES_PER_OBJECT})")
+                            if OBJECT_FAIL_HISTORY[obj_key] >= MAX_RETRIES_PER_OBJECT:
+                                print("🛑 上限に達したため、この物体を一時スキップして次を優先します。")
 
-                        # 2段階安全 Home 復帰
                         executor.move_to_home_and_wait(home_rad)
                         time.sleep(0.5)
                         state = "IDLE"
