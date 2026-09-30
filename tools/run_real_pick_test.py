@@ -172,7 +172,7 @@ def main():
     # 実機接続時は実機をまずホーム姿勢へ
     if executor.is_real_connected:
         print("🤖 実機をホーム姿勢へ初期化中...")
-        executor.move_to_rad(home_rad, duration_sec=1.5)
+        executor.move_to_home_and_wait(home_rad)  # 👉 move_to_home_and_wait に変更
 
     # スロット初期化
     slot_info = []
@@ -238,18 +238,18 @@ def main():
                 else:
                     sim.data.qpos[qadr:qadr + 3] = [0.0, 0.0, -1.0]
 
-            # [H] キーでのホーム復帰
+            # [H] ホーム復帰
             if REQ_GO_HOME:
                 REQ_GO_HOME = False
                 CURRENT_GRASP_TCP_MARKERS = None
-                executor.move_to_home_and_wait(home_rad)
+                executor.move_to_home_and_wait(home_rad)  # 👉 統一
 
             # [P] 実機シーケンス終了後のホーム復帰
                 if confirm == 'y':
                     print("🦾 実機把持シーケンスを開始します...")
                     executor.execute_waypoints(pick_sequence, send_to_real=True)
                     time.sleep(0.8)
-                    # 👉 到達監視付きの Home 復帰を実行
+                    # 👉 到達監視＆ID4先行引き上げ付きで Home 復帰
                     executor.move_to_home_and_wait(home_rad)
                     print("✨ 実機把持テストが完了しました！")
 

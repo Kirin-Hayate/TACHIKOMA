@@ -313,86 +313,100 @@ def solve_ik_wrist_and_pitch(
 
     return (rad_targets, "OK") if return_reason else rad_targets
 
+# --------------------------------------------------------------------------
+# 爪構造幾何定数 [m]
+# --------------------------------------------------------------------------
+FIXED_JAW_OFFSET_M = 0.020    # 手先中心軸から固定爪先端までの距離 (短手方向: 20mm)
+LANDING_MARGIN_M = 0.015      # 物体外縁から固定爪着地点までの安全マージン (短手方向: 15mm)
+
+
+# --------------------------------------------------------------------------
+# 爪構造幾何定数 [m]
+# --------------------------------------------------------------------------
+FIXED_JAW_OFFSET_M = 0.020    # 手先中心軸から固定爪先端までの距離 (短手方向: 20mm)
+LANDING_MARGIN_M = 0.015      # 物体外縁から固定爪着地点までの安全マージン (短手方向: 15mm)
+
+
 def solve_ik_tabletop_grasp(
-x_phys_mm: float,
+    x_phys_mm: float,
     y_phys_mm: float,
     z_phys_mm: float,
     angle_deg: float,
     obj_thickness_mm: float = 15.0,
     gripper_open_rad: float = GRIPPER_OPEN_RAD,
     enable_sag_compensation: bool = True,
-    verbose: bool = True  # 👉 デバッグログフラグを追加
+    verbose: bool = True
 ) -> Tuple[Optional[Dict[int, float]], Optional[Dict[int, float]], Optional[float]]:
     """
-    机上の物理直交座標 (X_mm, Y_mm, Z_mm) およびカメラ検出角度 (angle_deg) から、
-    非対称爪の干渉回避オフセットを算出して最適な把持姿勢と上空待機姿勢のペアを出力する。
-
-    引数:
-        x_phys_mm: ロボット基準前方奥行き (mm)
-        y_phys_mm: ロボット基準横方向変位 (mm, 右側が正)
-        z_phys_mm: 把持高さ (机面からの高さ mm, 通常は物体厚みの半分)
-        angle_deg: OpenCV で検出した物体の傾き角 (-90°〜+90°)
-        obj_thickness_mm: 挟み込む厚み (mm)
-    戻り値:
-        (ik_grasp_rad, ik_waypoint_rad, adopted_pitch_deg)
+    固定爪着地モデルに基づく把持 IK 計算 (長手中心アライメント完全版):
+    物体の長手(長辺)方向に対しては厳密に中心(中点)を維持し、
+    短手(厚み)方向にのみ固定爪の逃げマージンを設けて目標 TCP を決定する。
     """
-    # 1. 極座標系変換
-    base_theta_deg = math.degrees(math.atan2(y_phys_mm, x_phys_mm))
+    # 1. 物体中心のワールド座標 [m]
+    p_obj = np.array([x_phys_mm / 1000.0, y_phys_mm / 1000.0])
+    base_theta_rad = math.atan2(p_obj[1], p_obj[0])
+    base_theta_deg = math.degrees(base_theta_rad)
 
-    # --------------------------------------------------------------------------
-    # 2. 手首ロール角 (ID 5) のアライメント算出 (実測反転モデル)
-    # --------------------------------------------------------------------------
-    rel_roll_deg_1 = -(angle_deg - base_theta_deg)
-    
-    # 180° 対称性の正規化 (-90° 〜 +90°)
-    while rel_roll_deg_1 > 90.0:
-        rel_roll_deg_1 -= 180.0
-    while rel_roll_deg_1 <= -90.0:
-        rel_roll_deg_1 += 180.0
+    # 2. 物体の短手(厚み)方向単位ベクトル (長辺と直交する向き)
+    obj_rad = math.radians(angle_deg)
+    n_minor = np.array([-math.sin(obj_rad), math.cos(obj_rad)])
 
-    # 180° 反対向き候補
-    rel_roll_deg_2 = rel_roll_deg_1 + 180.0 if rel_roll_deg_1 < 0 else rel_roll_deg_1 - 180.0
+    # 3. 手首ロール角 (ID 5) の決定 (長辺に爪を直交させる)
+    rel_roll_1 = -(angle_deg - base_theta_deg)
+    while rel_roll_1 > 90.0:
+        rel_roll_1 -= 180.0
+    while rel_roll_1 <= -90.0:
+        rel_roll_1 += 180.0
 
-    # 👉 変更: 可動爪が物体側を向き、固定爪が外へ逃げるよう 180° 反対側の候補を採用
-    if abs(rel_roll_deg_1) <= abs(rel_roll_deg_2):
-        rel_roll_deg = rel_roll_deg_2
+    rel_roll_2 = rel_roll_1 + 180.0 if rel_roll_1 < 0 else rel_roll_1 - 180.0
+
+    # 原点 (0°) に近く可動域に余裕がある候補を選択
+    if abs(rel_roll_2) < abs(rel_roll_1):
+        chosen_rel_roll = rel_roll_2
     else:
-        rel_roll_deg = rel_roll_deg_1
+        chosen_rel_roll = rel_roll_1
 
-    wrist_roll_rad = math.radians(rel_roll_deg)
+    wrist_roll_rad = math.radians(chosen_rel_roll)
 
-    # --------------------------------------------------------------------------
-    # 3. 非対称爪（固定爪干渉回避）の目標点補正
-    # --------------------------------------------------------------------------
-    asym_shift_m = min(0.030, GRIPPER_ASYM_OFFSET_M + (min(25.0, obj_thickness_mm) / 2000.0))
-    global_yaw_rad = math.radians(base_theta_deg + rel_roll_deg)
-    shift_dx_m = -asym_shift_m * math.sin(global_yaw_rad)
-    shift_dy_m = asym_shift_m * math.cos(global_yaw_rad)
+    # 4. 短手方向の固定爪オフセット (長手方向のオフセットは一切加算しない)
+    half_thick_m = (obj_thickness_mm / 1000.0) / 2.0
+    total_offset_minor_m = half_thick_m + LANDING_MARGIN_M + FIXED_JAW_OFFSET_M
 
-    corr_x_m = (x_phys_mm / 1000.0) + shift_dx_m
-    corr_y_m = (y_phys_mm / 1000.0) + shift_dy_m
+    p_tcp_cand1 = p_obj + total_offset_minor_m * n_minor
+    p_tcp_cand2 = p_obj - total_offset_minor_m * n_minor
+
+    # 原点からの距離がより遠い側（物体の外側）に固定爪を逃がす
+    if np.linalg.norm(p_tcp_cand1) >= np.linalg.norm(p_tcp_cand2):
+        p_tcp = p_tcp_cand1
+        n_effective = n_minor
+    else:
+        p_tcp = p_tcp_cand2
+        n_effective = -n_minor
+
+    # 作業半径の安全クランプ
+    r_tcp = np.linalg.norm(p_tcp)
+    if r_tcp > 0.360:
+        p_tcp = p_tcp * (0.360 / r_tcp)
+        r_tcp = 0.360
+
+    theta_deg = math.degrees(math.atan2(p_tcp[1], p_tcp[0]))
     corr_z_m = z_phys_mm / 1000.0
 
-    r_check = math.hypot(corr_x_m, corr_y_m)
-    if r_check > 0.360:
-        scale = 0.360 / r_check
-        corr_x_m *= scale
-        corr_y_m *= scale
-
-    r_tcp = math.hypot(corr_x_m, corr_y_m)
-    theta_deg = math.degrees(math.atan2(corr_y_m, corr_x_m))
-
     if verbose:
-        print(f"   [幾何解析] 補正目標: r={r_tcp*1000:.1f}mm, θ={theta_deg:.1f}° | 手首ロール目標: {math.degrees(wrist_roll_rad):.1f}° (Raw≈{radian_to_raw(5, wrist_roll_rad)})")
+        p_fixed_land = p_obj + (half_thick_m + LANDING_MARGIN_M) * n_effective
+        print(f"   [把持幾何計算 (中心アライメント)]")
+        print(f"      物体中心   : ({p_obj[0]*1000:.1f}, {p_obj[1]*1000:.1f}) mm")
+        print(f"      固定爪着地 : ({p_fixed_land[0]*1000:.1f}, {p_fixed_land[1]*1000:.1f}) mm (短手マージン: +{LANDING_MARGIN_M*1000:.0f}mm)")
+        print(f"      目標 TCP   : ({p_tcp[0]*1000:.1f}, {p_tcp[1]*1000:.1f}) mm | 手首ロール: {chosen_rel_roll:.1f}°")
 
-    # 4. たわみ補正
+    # 5. たわみ補正
     if enable_sag_compensation:
         sag_offset = calculate_sag_compensation(r_tcp, math.radians(theta_deg))
         effective_z = corr_z_m + sag_offset
     else:
         effective_z = corr_z_m
 
-    # 5. ピッチ角探索ループ
+    # 6. ピッチ角探索ループ
     candidate_pitches = [80.0, 60.0, 40.0, 20.0]
     failure_logs = []
 
@@ -401,7 +415,6 @@ x_phys_mm: float,
         r_wrist_target = r_tcp - L_GRIPPER * math.cos(pitch_rad)
         z_wrist_target = effective_z + L_GRIPPER * math.sin(pitch_rad)
 
-        # 把持点 (Target)
         ik_target, reason_target = solve_ik_wrist_and_pitch(
             r_wrist=r_wrist_target,
             theta_deg=theta_deg,
@@ -416,7 +429,6 @@ x_phys_mm: float,
             failure_logs.append(f"ピッチ {pitch_deg:4.1f}° [把持点NG]: {reason_target}")
             continue
 
-        # 上空点 (Waypoint)
         warm_start_qpos = np.array([ik_target[sid] for sid in range(1, 7)])
         r_wrist_wp = r_wrist_target
         z_wrist_wp = z_wrist_target + DELTA_Z_WRIST_WP
@@ -444,7 +456,6 @@ x_phys_mm: float,
             print(f"      ✖ {log}")
 
     return None, None, None
-
 # ==============================================================================
 # 互換ラッパー (auto_calibrate_workspace.py 等の旧ツール用)
 # ==============================================================================

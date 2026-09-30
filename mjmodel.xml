@@ -1,0 +1,133 @@
+<mujoco model="so100_scene">
+  <compiler angle="radian" meshdir="assets/"/>
+
+  <visual>
+    <global offwidth="1920" offheight="1080"/>
+    <headlight ambient="0.6 0.6 0.6" diffuse="0.8 0.8 0.8" specular="0.3 0.3 0.3"/>
+    <rgba haze="0.18 0.18 0.2 1"/>
+  </visual>
+
+  <asset>
+    <texture type="skybox" colorspace="auto" builtin="gradient" rgb1="0.25 0.26 0.28" rgb2="0.12 0.12 0.14" width="512" height="3072"/>
+    <texture type="2d" colorspace="auto" name="grid" builtin="checker" rgb1="0.18 0.18 0.2" rgb2="0.22 0.22 0.24" width="512" height="512"/>
+    <material name="grid_mat" texture="grid" texrepeat="10 10" reflectance="0.05"/>
+    <material name="white_print" specular="0.3" shininess="0.3" rgba="0.88 0.88 0.88 1"/>
+    <material name="servo_mat" specular="0.6" rgba="0.18 0.38 0.75 1"/>
+    <material name="wood_mat" specular="0.1" shininess="0.1" rgba="0.85 0.72 0.52 1"/>
+    <mesh name="base_mesh" file="Base.stl"/>
+    <mesh name="base_motor_mesh" file="Base_Motor.stl"/>
+    <mesh name="rot_pitch_mesh" file="Rotation_Pitch.stl"/>
+    <mesh name="rot_pitch_motor_mesh" file="Rotation_Pitch_Motor.stl"/>
+    <mesh name="upper_arm_mesh" file="Upper_Arm.stl"/>
+    <mesh name="upper_arm_motor_mesh" file="Upper_Arm_Motor.stl"/>
+    <mesh name="lower_arm_mesh" file="Lower_Arm.stl"/>
+    <mesh name="lower_arm_motor_mesh" file="Lower_Arm_Motor.stl"/>
+    <mesh name="wrist_mesh" file="Wrist_Pitch_Roll.stl"/>
+    <mesh name="wrist_motor_mesh" file="Wrist_Pitch_Roll_Motor.stl"/>
+    <mesh name="fixed_jaw_mesh" file="Fixed_Jaw.stl"/>
+    <mesh name="fixed_jaw_motor_mesh" file="Fixed_Jaw_Motor.stl"/>
+    <mesh name="moving_jaw_mesh" file="Moving_Jaw.stl"/>
+  </asset>
+
+  <worldbody>
+    <geom name="floor" size="1.5 1.5 0.05" type="plane" material="grid_mat"/>
+    <light pos="0 -0.6 1.8" dir="0 0.287348 -0.957826" type="directional"/>
+    <body name="base">
+      <geom type="mesh" material="white_print" mesh="base_mesh"/>
+      <geom type="mesh" material="servo_mat" mesh="base_motor_mesh"/>
+      <body name="shoulder" pos="0 -0.0452 0.0165" quat="0.707109 0.707105 0 0">
+        <joint name="shoulder_pan" range="-2 2" axis="0 1 0"/>
+        <geom type="mesh" material="white_print" mesh="rot_pitch_mesh"/>
+        <geom type="mesh" material="servo_mat" mesh="rot_pitch_motor_mesh"/>
+        <body name="upper_arm" pos="0 0.1025 0.0306" quat="0.62161 -0.783327 0 0">
+          <joint name="shoulder_lift" range="0 3.5" axis="1 0 0"/>
+          <geom type="mesh" material="white_print" mesh="upper_arm_mesh"/>
+          <geom type="mesh" material="servo_mat" mesh="upper_arm_motor_mesh"/>
+          <body name="lower_arm" pos="0 0.11257 0.028" quat="0.707109 0.707105 0 0">
+            <joint name="elbow_flex" range="-3.14158 0" axis="1 0 0"/>
+            <geom type="mesh" material="white_print" mesh="lower_arm_mesh"/>
+            <geom type="mesh" material="servo_mat" mesh="lower_arm_motor_mesh"/>
+            <body name="wrist" pos="0 0.0052 0.1349" quat="0.877583 -0.479426 0 0">
+              <joint name="wrist_flex" range="-2.5 1.2" axis="1 0 0"/>
+              <geom type="mesh" material="white_print" mesh="wrist_mesh"/>
+              <geom type="mesh" material="servo_mat" mesh="wrist_motor_mesh"/>
+              <body name="gripper" pos="0 -0.0601 0" quat="0.707109 0 0.707105 0">
+                <joint name="wrist_roll" range="-3.14158 3.14158" axis="0 1 0"/>
+                <geom type="mesh" material="white_print" mesh="fixed_jaw_mesh"/>
+                <geom type="mesh" material="servo_mat" mesh="fixed_jaw_motor_mesh"/>
+                <body name="jaw" pos="-0.0202 -0.0244 0" quat="6.32679e-06 0 1 0">
+                  <joint name="gripper_jaw" range="-0.2 2"/>
+                  <geom type="mesh" material="white_print" mesh="moving_jaw_mesh"/>
+                </body>
+              </body>
+            </body>
+          </body>
+        </body>
+      </body>
+    </body>
+    <body name="obj_block_0" pos="0 0 -1">
+      <joint type="free"/>
+      <geom name="geom_obj_0" size="0.0199 0.0188 0.0075" type="box" mass="0.02" material="wood_mat"/>
+    </body>
+    <body name="obj_block_1" pos="0 0 -1">
+      <joint type="free"/>
+      <geom name="geom_obj_1" size="0.07345 0.0205 0.0075" type="box" mass="0.02" material="wood_mat"/>
+    </body>
+    <body name="obj_block_2" pos="0 0 -1">
+      <joint type="free"/>
+      <geom name="geom_obj_2" size="0.0338 0.02195 0.0075" type="box" mass="0.02" material="wood_mat"/>
+    </body>
+    <body name="obj_block_3" pos="0 0 -1">
+      <joint type="free"/>
+      <geom name="geom_obj_3" size="0.02 0.02 0.01" type="box" mass="0.02" material="wood_mat"/>
+    </body>
+    <body name="obj_block_4" pos="0 0 -1">
+      <joint type="free"/>
+      <geom name="geom_obj_4" size="0.02 0.02 0.01" type="box" mass="0.02" material="wood_mat"/>
+    </body>
+    <body name="obj_block_5" pos="0 0 -1">
+      <joint type="free"/>
+      <geom name="geom_obj_5" size="0.02 0.02 0.01" type="box" mass="0.02" material="wood_mat"/>
+    </body>
+    <body name="obj_block_6" pos="0 0 -1">
+      <joint type="free"/>
+      <geom name="geom_obj_6" size="0.02 0.02 0.01" type="box" mass="0.02" material="wood_mat"/>
+    </body>
+    <body name="obj_block_7" pos="0 0 -1">
+      <joint type="free"/>
+      <geom name="geom_obj_7" size="0.02 0.02 0.01" type="box" mass="0.02" material="wood_mat"/>
+    </body>
+    <body name="obj_block_8" pos="0 0 -1">
+      <joint type="free"/>
+      <geom name="geom_obj_8" size="0.02 0.02 0.01" type="box" mass="0.02" material="wood_mat"/>
+    </body>
+    <body name="obj_block_9" pos="0 0 -1">
+      <joint type="free"/>
+      <geom name="geom_obj_9" size="0.02 0.02 0.01" type="box" mass="0.02" material="wood_mat"/>
+    </body>
+    <body name="obj_block_10" pos="0 0 -1">
+      <joint type="free"/>
+      <geom name="geom_obj_10" size="0.02 0.02 0.01" type="box" mass="0.02" material="wood_mat"/>
+    </body>
+    <body name="obj_block_11" pos="0 0 -1">
+      <joint type="free"/>
+      <geom name="geom_obj_11" size="0.02 0.02 0.01" type="box" mass="0.02" material="wood_mat"/>
+    </body>
+    <body name="obj_block_12" pos="0 0 -1">
+      <joint type="free"/>
+      <geom name="geom_obj_12" size="0.02 0.02 0.01" type="box" mass="0.02" material="wood_mat"/>
+    </body>
+    <body name="obj_block_13" pos="0 0 -1">
+      <joint type="free"/>
+      <geom name="geom_obj_13" size="0.02 0.02 0.01" type="box" mass="0.02" material="wood_mat"/>
+    </body>
+    <body name="obj_block_14" pos="0 0 -1">
+      <joint type="free"/>
+      <geom name="geom_obj_14" size="0.02 0.02 0.01" type="box" mass="0.02" material="wood_mat"/>
+    </body>
+    <body name="obj_block_15" pos="0 0 -1">
+      <joint type="free"/>
+      <geom name="geom_obj_15" size="0.02 0.02 0.01" type="box" mass="0.02" material="wood_mat"/>
+    </body>
+  </worldbody>
+</mujoco>
