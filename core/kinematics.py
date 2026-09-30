@@ -326,7 +326,6 @@ LANDING_MARGIN_M = 0.015      # 物体外縁から固定爪着地点までの安
 FIXED_JAW_OFFSET_M = 0.020    # 手先中心軸から固定爪先端までの距離 (短手方向: 20mm)
 LANDING_MARGIN_M = 0.015      # 物体外縁から固定爪着地点までの安全マージン (短手方向: 15mm)
 
-
 def solve_ik_tabletop_grasp(
     x_phys_mm: float,
     y_phys_mm: float,
@@ -335,21 +334,25 @@ def solve_ik_tabletop_grasp(
     obj_thickness_mm: float = 15.0,
     gripper_open_rad: float = GRIPPER_OPEN_RAD,
     enable_sag_compensation: bool = True,
+    offset_major_mm: float = 0.0,  # 👉 追加: 長い辺に沿ったオフセット [mm]
+    offset_minor_mm: float = 0.0,  # 👉 追加: 短い辺に沿ったオフセット [mm]
     verbose: bool = True
 ) -> Tuple[Optional[Dict[int, float]], Optional[Dict[int, float]], Optional[float]]:
     """
-    固定爪着地モデルに基づく把持 IK 計算 (長手中心アライメント完全版):
-    物体の長手(長辺)方向に対しては厳密に中心(中点)を維持し、
-    短手(厚み)方向にのみ固定爪の逃げマージンを設けて目標 TCP を決定する。
+    固定爪着地モデルに基づく把持 IK 計算:
+    offset_major_mm / offset_minor_mm により、物体の長辺・短辺方向の目標点を独立調整可能。
     """
     # 1. 物体中心のワールド座標 [m]
     p_obj = np.array([x_phys_mm / 1000.0, y_phys_mm / 1000.0])
     base_theta_rad = math.atan2(p_obj[1], p_obj[0])
     base_theta_deg = math.degrees(base_theta_rad)
 
-    # 2. 物体の短手(厚み)方向単位ベクトル (長辺と直交する向き)
+    # 2. 物体の長辺・短辺の幾何単位ベクトル
     obj_rad = math.radians(angle_deg)
-    n_minor = np.array([-math.sin(obj_rad), math.cos(obj_rad)])
+    # 角度方向 (cv2.minAreaRect 出力軸)
+    u_axis = np.array([math.cos(obj_rad), math.sin(obj_rad)])
+    # 角度直交方向
+    n_axis = np.array([-math.sin(obj_rad), math.cos(obj_rad)])
 
     # 3. 手首ロール角 (ID 5) の決定 (長辺に爪を直交させる)
     rel_roll_1 = -(angle_deg - base_theta_deg)
@@ -360,7 +363,6 @@ def solve_ik_tabletop_grasp(
 
     rel_roll_2 = rel_roll_1 + 180.0 if rel_roll_1 < 0 else rel_roll_1 - 180.0
 
-    # 原点 (0°) に近く可動域に余裕がある候補を選択
     if abs(rel_roll_2) < abs(rel_roll_1):
         chosen_rel_roll = rel_roll_2
     else:
@@ -368,20 +370,26 @@ def solve_ik_tabletop_grasp(
 
     wrist_roll_rad = math.radians(chosen_rel_roll)
 
-    # 4. 短手方向の固定爪オフセット (長手方向のオフセットは一切加算しない)
+    # 4. 短手方向の固定爪オフセット (ベース位置の決定)
     half_thick_m = (obj_thickness_mm / 1000.0) / 2.0
     total_offset_minor_m = half_thick_m + LANDING_MARGIN_M + FIXED_JAW_OFFSET_M
 
-    p_tcp_cand1 = p_obj + total_offset_minor_m * n_minor
-    p_tcp_cand2 = p_obj - total_offset_minor_m * n_minor
+    p_tcp_cand1 = p_obj + total_offset_minor_m * n_axis
+    p_tcp_cand2 = p_obj - total_offset_minor_m * n_axis
 
-    # 原点からの距離がより遠い側（物体の外側）に固定爪を逃がす
     if np.linalg.norm(p_tcp_cand1) >= np.linalg.norm(p_tcp_cand2):
-        p_tcp = p_tcp_cand1
-        n_effective = n_minor
+        p_tcp_base = p_tcp_cand1
+        n_effective = n_axis
     else:
-        p_tcp = p_tcp_cand2
-        n_effective = -n_minor
+        p_tcp_base = p_tcp_cand2
+        n_effective = -n_axis
+
+    # --------------------------------------------------------------------------
+    # 5. 👉 長辺・短辺方向の独立オフセット付加
+    # --------------------------------------------------------------------------
+    # ユーザーが指定した長辺オフセット (u_axis 方向) と短辺オフセット (n_effective 方向) を加算
+    shift_vector = (offset_major_mm / 1000.0) * u_axis + (offset_minor_mm / 1000.0) * n_effective
+    p_tcp = p_tcp_base + shift_vector
 
     # 作業半径の安全クランプ
     r_tcp = np.linalg.norm(p_tcp)
@@ -393,20 +401,22 @@ def solve_ik_tabletop_grasp(
     corr_z_m = z_phys_mm / 1000.0
 
     if verbose:
-        p_fixed_land = p_obj + (half_thick_m + LANDING_MARGIN_M) * n_effective
-        print(f"   [把持幾何計算 (中心アライメント)]")
-        print(f"      物体中心   : ({p_obj[0]*1000:.1f}, {p_obj[1]*1000:.1f}) mm")
-        print(f"      固定爪着地 : ({p_fixed_land[0]*1000:.1f}, {p_fixed_land[1]*1000:.1f}) mm (短手マージン: +{LANDING_MARGIN_M*1000:.0f}mm)")
-        print(f"      目標 TCP   : ({p_tcp[0]*1000:.1f}, {p_tcp[1]*1000:.1f}) mm | 手首ロール: {chosen_rel_roll:.1f}°")
+        p_fixed_land = p_obj + (half_thick_m + LANDING_MARGIN_M) * n_effective + shift_vector
+        print(f"   [把持幾何計算 (パラメータ手動調整モード)]")
+        print(f"      物体中心       : ({p_obj[0]*1000:.1f}, {p_obj[1]*1000:.1f}) mm")
+        print(f"      長辺オフセット : {offset_major_mm:+.1f} mm")
+        print(f"      短辺オフセット : {offset_minor_mm:+.1f} mm")
+        print(f"      固定爪着地     : ({p_fixed_land[0]*1000:.1f}, {p_fixed_land[1]*1000:.1f}) mm")
+        print(f"      目標 TCP       : ({p_tcp[0]*1000:.1f}, {p_tcp[1]*1000:.1f}) mm | 手首ロール: {chosen_rel_roll:.1f}°")
 
-    # 5. たわみ補正
+    # 6. たわみ補正
     if enable_sag_compensation:
         sag_offset = calculate_sag_compensation(r_tcp, math.radians(theta_deg))
         effective_z = corr_z_m + sag_offset
     else:
         effective_z = corr_z_m
 
-    # 6. ピッチ角探索ループ
+    # 7. ピッチ角探索ループ
     candidate_pitches = [80.0, 60.0, 40.0, 20.0]
     failure_logs = []
 

@@ -44,6 +44,12 @@ try:
 except ImportError:
     HAS_HARDWARE_MODULE = False
 
+# --------------------------------------------------------------------------
+# 実験用：把持目標位置の微調整オフセット (単位: mm)
+# --------------------------------------------------------------------------
+MANUAL_OFFSET_MAJOR_MM = -15.0   # 長い辺に沿ったオフセット (+で一方へ, -で逆へ)
+MANUAL_OFFSET_MINOR_MM = -50.0   # 短い辺(厚み)に沿ったオフセット (+で外側へ, -で物体寄りへ)
+
 MAX_SLOTS = 16
 DEFAULT_OBJ_HEIGHT_M = 0.015
 HALF_Z = DEFAULT_OBJ_HEIGHT_M / 2.0
@@ -284,7 +290,9 @@ def main():
                         angle_deg=angle_deg,
                         obj_thickness_mm=minor_mm,
                         gripper_open_rad=GRIPPER_OPEN_RAD,
-                        enable_sag_compensation=True
+                        enable_sag_compensation=True,
+                        offset_major_mm=MANUAL_OFFSET_MAJOR_MM,  # 👉 パラメータ渡し
+                        offset_minor_mm=MANUAL_OFFSET_MINOR_MM   # 👉 パラメータ渡し
                     )
 
                     if ik_grasp is None or ik_wp is None:
