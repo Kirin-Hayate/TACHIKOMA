@@ -67,9 +67,9 @@ PICK_Z_MM = 2.0                  # 把持高度 (机面 +2mm)
 
 PICK_Z_MM = 2.0                  # 把持高度 (机面 +2mm)
 
-# 👉 【追加】リトライ制御およびブラックリスト設定
-MAX_RETRIES_PER_OBJECT = 3       # 同一物体への最大リトライ回数 (超えたらスキップ)
-OBJECT_FAIL_HISTORY: Dict[str, int] = {}  # 物体座標キーごとの失敗カウント記録
+# 👉 【変更】同一物体への最大リトライ回数を 6 回に引き上げ
+MAX_RETRIES_PER_OBJECT = 6       # 6回連続失敗したらスキップ
+OBJECT_FAIL_HISTORY: Dict[str, int] = {}
 
 # 空振り判定閾値 (ID 6 の角度が完全に閉じた状態に近い場合は空振りと判定)
 # 👉 【修正】Raw 生値による空振り判定閾値設定
@@ -247,24 +247,46 @@ def main():
                     obj_key = f"{int(round(x_mm / 30.0))}_{int(round(y_mm / 30.0))}"
                     fail_count = OBJECT_FAIL_HISTORY.get(obj_key, 0)
 
-                    # 👉 【戦略的リトライ ＆ ランダムジッターの算出】
+                    # ----------------------------------------------------------
+                    # 👉 【6 段階 戦略的リトライ ＆ ランダムジッター】
+                    # ----------------------------------------------------------
                     cur_major = MANUAL_OFFSET_MAJOR_MM
                     cur_minor = MANUAL_OFFSET_MINOR_MM
                     cur_z = PICK_Z_MM
 
                     if fail_count == 1:
-                        # リトライ1回目: 把持高度を深くし、物体側に少し寄せる
+                        # 試行 2: 深掘り (机面スレスレ)
                         cur_z = max(0.0, cur_z - 2.0)
-                        cur_major -= 5.0
-                        print(f"   🔄 [リトライ 1] 深掘りアプローチ (Z: {cur_z:.1f}mm, Minor: {cur_minor:+.1f}mm)")
-                    elif fail_count >= 2:
-                        # リトライ2回目以降: 長手シフト + ランダム摂動 (ジッター)
-                        jitter_major = random.uniform(-6.0, 6.0)
-                        jitter_minor = random.uniform(-4.0, 4.0)
-                        cur_major += (15.0 if fail_count % 2 == 0 else -15.0) + jitter_major
+                        print(f"   🔄 [リトライ 1/5] 深掘りアプローチ (Z: {cur_z:.1f}mm)")
+
+                    elif fail_count == 2:
+                        # 試行 3: 長手を順方向に +15mm シフト + 微小ジッター
+                        jitter_major = random.uniform(-4.0, 4.0)
+                        cur_major += 15.0 + jitter_major
+                        cur_z = max(0.0, cur_z - 1.5)
+                        print(f"   🔄 [リトライ 2/5] 長手(+)シフト (Major: {cur_major:+.1f}mm, Z: {cur_z:.1f}mm)")
+
+                    elif fail_count == 3:
+                        # 試行 4: 長手を逆方向に -15mm シフト + 微小ジッター
+                        jitter_major = random.uniform(-4.0, 4.0)
+                        cur_major -= 15.0 + jitter_major
+                        cur_z = max(0.0, cur_z - 1.5)
+                        print(f"   🔄 [リトライ 3/5] 長手(-)シフト (Major: {cur_major:+.1f}mm, Z: {cur_z:.1f}mm)")
+
+                    elif fail_count == 4:
+                        # 試行 5: 短手を物体寄りに +8mm 引き込み + 深掘り
+                        cur_minor += 8.0
+                        cur_z = max(0.0, cur_z - 2.0)
+                        print(f"   🔄 [リトライ 4/5] 短手引き込み深掘り (Minor: {cur_minor:+.1f}mm, Z: {cur_z:.1f}mm)")
+
+                    elif fail_count >= 5:
+                        # 試行 6: 全方向広角ランダムジッター (ラストトライ)
+                        jitter_major = random.uniform(-10.0, 10.0)
+                        jitter_minor = random.uniform(-6.0, 6.0)
+                        cur_major += jitter_major
                         cur_minor += jitter_minor
                         cur_z = max(0.0, cur_z - 1.5)
-                        print(f"   🔄 [リトライ {fail_count}] 摂動アプローチ (Major: {cur_major:+.1f}mm, Minor: {cur_minor:+.1f}mm, Z: {cur_z:.1f}mm)")
+                        print(f"   🔄 [リトライ 5/5] 広角ジッター探索 (Major: {cur_major:+.1f}mm, Minor: {cur_minor:+.1f}mm)")
 
                     # 1. Pick 側 IK
                     ik_grasp, ik_pick_wp, _ = solve_ik_tabletop_grasp(
