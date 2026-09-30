@@ -385,28 +385,26 @@ def solve_ik_tabletop_grasp(
         n_effective = -n_axis
 
     # --------------------------------------------------------------------------
-    # 5. 👉 長辺・短辺方向の独立オフセット付加
+    # 5. 長辺・短辺方向の独立オフセット付加
     # --------------------------------------------------------------------------
-    # ユーザーが指定した長辺オフセット (u_axis 方向) と短辺オフセット (n_effective 方向) を加算
     shift_vector = (offset_major_mm / 1000.0) * u_axis + (offset_minor_mm / 1000.0) * n_effective
     p_tcp = p_tcp_base + shift_vector
 
-    # 作業半径の安全クランプ
+    # 👉 【変更点 1】作業半径クランプを 360mm -> 450mm に拡張
     r_tcp = np.linalg.norm(p_tcp)
-    if r_tcp > 0.360:
-        p_tcp = p_tcp * (0.360 / r_tcp)
-        r_tcp = 0.360
+    MAX_REACH_M = 0.450  # 450mm まで許容
+    if r_tcp > MAX_REACH_M:
+        p_tcp = p_tcp * (MAX_REACH_M / r_tcp)
+        r_tcp = MAX_REACH_M
 
     theta_deg = math.degrees(math.atan2(p_tcp[1], p_tcp[0]))
     corr_z_m = z_phys_mm / 1000.0
 
     if verbose:
         p_fixed_land = p_obj + (half_thick_m + LANDING_MARGIN_M) * n_effective + shift_vector
-        print(f"   [把持幾何計算 (パラメータ手動調整モード)]")
+        print(f"   [把持幾何計算 (可動域拡張モード)]")
         print(f"      物体中心       : ({p_obj[0]*1000:.1f}, {p_obj[1]*1000:.1f}) mm")
-        print(f"      長辺オフセット : {offset_major_mm:+.1f} mm")
-        print(f"      短辺オフセット : {offset_minor_mm:+.1f} mm")
-        print(f"      固定爪着地     : ({p_fixed_land[0]*1000:.1f}, {p_fixed_land[1]*1000:.1f}) mm")
+        print(f"      到達半径 r_tcp : {r_tcp*1000:.1f} mm (上限: {MAX_REACH_M*1000:.0f} mm)")
         print(f"      目標 TCP       : ({p_tcp[0]*1000:.1f}, {p_tcp[1]*1000:.1f}) mm | 手首ロール: {chosen_rel_roll:.1f}°")
 
     # 6. たわみ補正
@@ -416,8 +414,10 @@ def solve_ik_tabletop_grasp(
     else:
         effective_z = corr_z_m
 
-    # 7. ピッチ角探索ループ
-    candidate_pitches = [80.0, 60.0, 40.0, 20.0]
+    # --------------------------------------------------------------------------
+    # 7. 👉 【変更点 2】ピッチ角探索ループに浅い進入角 (10°, 5°) を追加
+    # --------------------------------------------------------------------------
+    candidate_pitches = [80.0, 60.0, 40.0, 20.0, 10.0, 5.0]
     failure_logs = []
 
     for pitch_deg in candidate_pitches:
