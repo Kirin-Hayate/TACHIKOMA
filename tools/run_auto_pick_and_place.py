@@ -1,19 +1,12 @@
 """
 ==============================================================================
-自律連続 Pick & Place 自動化システム
+自律連続 Pick & Place 自動化システム (MuJoCo リアルタイム可視化対応版)
 (tools/run_auto_pick_and_place.py)
 ==============================================================================
 【概要】
 カメラ認識した机上の複数物体を自動選定し、人間の介入なしに
-次々と指定エリア (Place Area) へ連続で仕分け・搬送する自律スクリプトです。
-
-【主な機能】
-1. 自律タスクスケジューラ:
-   - 検出された物体群から、ロボット中心に近い安全な物体を自動選定してキューイング。
-2. グリッパ把持成否フィードバック:
-   - 爪を閉じた際、サーボ ID 6 の物理現在値を読み取り、空振り（把持失敗）を自動検知。
-3. 2段階安全 Home 復帰 & S字加減速軌道:
-   - 確立済みの安全ルーチンで連続稼働時のサーボ脱調・過負荷を防止。
+次々と指定エリア (Place Area) へ連続で仕分け・搬送する自律スクリプト。
+MuJoCo 画面上にアーム・ArUcoマーカー・検出物体・把持マーカーをリアルタイム同期します。
 ==============================================================================
 """
 
@@ -65,17 +58,11 @@ PLACE_ANGLE_DEG = 0.0            # 配置姿勢角
 
 PICK_Z_MM = 2.0                  # 把持高度 (机面 +2mm)
 
-PICK_Z_MM = 2.0                  # 把持高度 (机面 +2mm)
-
-# 👉 【変更】同一物体への最大リトライ回数を 6 回に引き上げ
-MAX_RETRIES_PER_OBJECT = 6       # 6回連続失敗したらスキップ
+MAX_RETRIES_PER_OBJECT = 6       # 同一物体への最大リトライ回数 (超えたらスキップ)
 OBJECT_FAIL_HISTORY: Dict[str, int] = {}
 
-# 空振り判定閾値 (ID 6 の角度が完全に閉じた状態に近い場合は空振りと判定)
-# 👉 【修正】Raw 生値による空振り判定閾値設定
-# 爪完全閉止時の実測値: 1889
+# 爪完全閉止時の実測値
 GRIPPER_CLOSED_RAW = 1889
-# 閉止位置からこのカウント幅以内なら「空振り」と判定 (約 50〜70 カウント)
 EMPTY_GRASP_TOLERANCE_RAW = 30
 
 MAX_SLOTS = 16
@@ -85,6 +72,8 @@ HALF_Z = DEFAULT_OBJ_HEIGHT_M / 2.0
 REQ_QUIT = False
 REQ_PAUSE = False
 REQ_SAVE_BG = False
+
+CURRENT_GRASP_TCP_MARKERS: Optional[Dict[str, np.ndarray]] = None
 
 
 def sim_key_callback(keycode: int):
@@ -104,11 +93,59 @@ def euler_yaw_to_quat(yaw_rad: float) -> np.ndarray:
     return np.array([math.cos(half), 0.0, 0.0, math.sin(half)], dtype=np.float64)
 
 
+def draw_markers(sim, projector, markers_dict):
+    """MuJoCo の user_scn に ArUco マーカーと把持目標点を描画"""
+    if sim.viewer is None:
+        return
+    sim.viewer.user_scn.ngeom = 0
+
+    # 1. ArUco マーカーの四角形描画
+    half_s, half_th = 0.02, 0.0002
+    for m_idx in range(4):
+        px, py = projector.marker_phys_xy[m_idx]
+        mx, my = -py / 1000.0, -px / 1000.0
+        if sim.viewer.user_scn.ngeom < sim.viewer.user_scn.maxgeom:
+            ng = sim.viewer.user_scn.ngeom
+            mujoco.mjv_initGeom(
+                sim.viewer.user_scn.geoms[ng],
+                type=mujoco.mjtGeom.mjGEOM_BOX,
+                size=np.array([half_s, half_s, half_th]),
+                pos=np.array([mx, my, half_th]),
+                mat=np.eye(3).flatten(),
+                rgba=np.array([0.9, 0.9, 0.9, 0.9])
+            )
+            sim.viewer.user_scn.ngeom += 1
+
+    # 2. 把持目標点 (シアン) & たわみ補正点 (赤) の球体マーカー
+    if markers_dict:
+        t_pos = markers_dict.get("target_tcp")
+        s_pos = markers_dict.get("sag_tcp")
+        if t_pos is not None and sim.viewer.user_scn.ngeom < sim.viewer.user_scn.maxgeom:
+            ng = sim.viewer.user_scn.ngeom
+            mujoco.mjv_initGeom(
+                sim.viewer.user_scn.geoms[ng],
+                type=mujoco.mjtGeom.mjGEOM_SPHERE,
+                size=np.array([0.007, 0.007, 0.007]),
+                pos=t_pos,
+                mat=np.eye(3).flatten(),
+                rgba=np.array([0.1, 0.8, 1.0, 0.9])
+            )
+            sim.viewer.user_scn.ngeom += 1
+        if s_pos is not None and sim.viewer.user_scn.ngeom < sim.viewer.user_scn.maxgeom:
+            ng = sim.viewer.user_scn.ngeom
+            mujoco.mjv_initGeom(
+                sim.viewer.user_scn.geoms[ng],
+                type=mujoco.mjtGeom.mjGEOM_SPHERE,
+                size=np.array([0.007, 0.007, 0.007]),
+                pos=s_pos,
+                mat=np.eye(3).flatten(),
+                rgba=np.array([1.0, 0.2, 0.2, 0.95])
+            )
+            sim.viewer.user_scn.ngeom += 1
+
+
 def select_best_target(detected_objs: List[Dict]) -> Optional[int]:
-    """
-    検出物体から最近傍の対象を選定。
-    配置済みエリア内、および連続失敗上限に達した物体は除外する。
-    """
+    """検出物体から最近傍の対象を選定。配置済みエリアや連続失敗上限の物体は除外"""
     if not detected_objs:
         return None
 
@@ -121,7 +158,6 @@ def select_best_target(detected_objs: List[Dict]) -> Optional[int]:
         if dist_to_place < 40.0:
             continue
 
-        # 👉 過去に失敗回数上限に達した物体はスキップ
         obj_key = f"{int(round(x / 30.0))}_{int(round(y / 30.0))}"
         if OBJECT_FAIL_HISTORY.get(obj_key, 0) >= MAX_RETRIES_PER_OBJECT:
             continue
@@ -135,7 +171,7 @@ def select_best_target(detected_objs: List[Dict]) -> Optional[int]:
 
 
 def main():
-    global REQ_QUIT, REQ_PAUSE, REQ_SAVE_BG
+    global REQ_QUIT, REQ_PAUSE, REQ_SAVE_BG, CURRENT_GRASP_TCP_MARKERS
 
     print("==================================================")
     print(" 🤖 SO-ARM100 完全自律 Pick & Place システム")
@@ -175,6 +211,20 @@ def main():
         print("🤖 実機をホーム姿勢へ初期化中...")
         executor.move_to_home_and_wait(home_rad)
 
+    # MuJoCo の物体スロット初期化
+    slot_info = []
+    for i in range(MAX_SLOTS):
+        bname = f"obj_block_{i}"
+        gname = f"geom_obj_{i}"
+        bid = mujoco.mj_name2id(sim.model, mujoco.mjtObj.mjOBJ_BODY, bname)
+        gid = mujoco.mj_name2id(sim.model, mujoco.mjtObj.mjOBJ_GEOM, gname)
+        if bid == -1:
+            bid = mujoco.mj_name2id(sim.model, mujoco.mjtObj.mjOBJ_BODY, f"jenga_block_{i}")
+            if bid != -1:
+                gid = sim.model.body_geomadr[bid]
+        qadr = sim.model.jnt_qposadr[sim.model.body_jntadr[bid]] if bid != -1 else None
+        slot_info.append({"bid": bid, "gid": gid, "qpos_adr": qadr})
+
     projector = VisionProjector()
     cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
     if not cap.isOpened():
@@ -182,7 +232,6 @@ def main():
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
 
-    # カメラ露光安定化ウォームアップ
     for _ in range(5):
         cap.read()
         time.sleep(0.04)
@@ -190,8 +239,7 @@ def main():
     detector = TabletopDetector(projector)
     cv2.namedWindow("Autonomous Pick & Place", cv2.WINDOW_AUTOSIZE)
 
-    # 状態管理
-    state = "IDLE"  # IDLE -> DETECT -> EXECUTE -> VERIFY
+    state = "IDLE"
     target_obj_cache = None
     stable_detect_count = 0
 
@@ -224,14 +272,42 @@ def main():
             annotated = detector.draw_annotations(warped, detected_objs, target_idx=None)
 
             # ------------------------------------------------------------------
+            # 🖼️ MuJoCo リアルタイム描画同期 (ArUco マーカー & 検出物体)
+            # ------------------------------------------------------------------
+            draw_markers(sim, projector, CURRENT_GRASP_TCP_MARKERS)
+
+            for i in range(MAX_SLOTS):
+                sinfo = slot_info[i]
+                qadr, gid = sinfo["qpos_adr"], sinfo["gid"]
+                if qadr is None or gid == -1:
+                    continue
+
+                if i < len(detected_objs):
+                    obj = detected_objs[i]
+                    x_mm, y_mm = obj["phys_xy"]
+                    major_mm, minor_mm = obj["size_mm"]
+
+                    # MuJoCo 座標系 [-Y, -X, Z] へのマッピング
+                    sim.data.qpos[qadr:qadr + 3] = [-y_mm / 1000.0, -x_mm / 1000.0, HALF_Z]
+                    sim.data.qpos[qadr + 3:qadr + 7] = euler_yaw_to_quat(math.radians(-obj["angle_deg"]))
+                    sim.model.geom_size[gid] = [max(0.005, major_mm / 2000.0), max(0.005, minor_mm / 2000.0), HALF_Z]
+                else:
+                    # 検出されていないスロットは机の下へ隠す
+                    sim.data.qpos[qadr:qadr + 3] = [0.0, 0.0, -1.0]
+
+            mujoco.mj_forward(sim.model, sim.data)
+            if sim.viewer is not None:
+                sim.viewer.sync()
+
+            # ------------------------------------------------------------------
             # 自律ステートマシン
             # ------------------------------------------------------------------
             if not REQ_PAUSE:
                 if state == "IDLE":
+                    CURRENT_GRASP_TCP_MARKERS = None
                     best_target_idx = select_best_target(detected_objs)
                     if best_target_idx is not None:
                         stable_detect_count += 1
-                        # 3フレーム連続で同一候補が捉えられたら動作開始（チャタリング防止）
                         if stable_detect_count >= 3:
                             target_obj_cache = detected_objs[best_target_idx]
                             print(f"\n🎯 把持対象 #{best_target_idx} を自動選定: ({target_obj_cache['phys_xy'][0]:.1f}, {target_obj_cache['phys_xy'][1]:.1f})")
@@ -247,46 +323,44 @@ def main():
                     obj_key = f"{int(round(x_mm / 30.0))}_{int(round(y_mm / 30.0))}"
                     fail_count = OBJECT_FAIL_HISTORY.get(obj_key, 0)
 
-                    # ----------------------------------------------------------
-                    # 👉 【6 段階 戦略的リトライ ＆ ランダムジッター】
-                    # ----------------------------------------------------------
+                    # 6段階リトライ戦略
                     cur_major = MANUAL_OFFSET_MAJOR_MM
                     cur_minor = MANUAL_OFFSET_MINOR_MM
                     cur_z = PICK_Z_MM
 
                     if fail_count == 1:
-                        # 試行 2: 深掘り (机面スレスレ)
                         cur_z = max(0.0, cur_z - 2.0)
                         print(f"   🔄 [リトライ 1/5] 深掘りアプローチ (Z: {cur_z:.1f}mm)")
-
                     elif fail_count == 2:
-                        # 試行 3: 長手を順方向に +15mm シフト + 微小ジッター
                         jitter_major = random.uniform(-4.0, 4.0)
                         cur_major += 15.0 + jitter_major
                         cur_z = max(0.0, cur_z - 1.5)
                         print(f"   🔄 [リトライ 2/5] 長手(+)シフト (Major: {cur_major:+.1f}mm, Z: {cur_z:.1f}mm)")
-
                     elif fail_count == 3:
-                        # 試行 4: 長手を逆方向に -15mm シフト + 微小ジッター
                         jitter_major = random.uniform(-4.0, 4.0)
                         cur_major -= 15.0 + jitter_major
                         cur_z = max(0.0, cur_z - 1.5)
                         print(f"   🔄 [リトライ 3/5] 長手(-)シフト (Major: {cur_major:+.1f}mm, Z: {cur_z:.1f}mm)")
-
                     elif fail_count == 4:
-                        # 試行 5: 短手を物体寄りに +8mm 引き込み + 深掘り
                         cur_minor += 8.0
                         cur_z = max(0.0, cur_z - 2.0)
                         print(f"   🔄 [リトライ 4/5] 短手引き込み深掘り (Minor: {cur_minor:+.1f}mm, Z: {cur_z:.1f}mm)")
-
                     elif fail_count >= 5:
-                        # 試行 6: 全方向広角ランダムジッター (ラストトライ)
                         jitter_major = random.uniform(-10.0, 10.0)
                         jitter_minor = random.uniform(-6.0, 6.0)
                         cur_major += jitter_major
                         cur_minor += jitter_minor
                         cur_z = max(0.0, cur_z - 1.5)
                         print(f"   🔄 [リトライ 5/5] 広角ジッター探索 (Major: {cur_major:+.1f}mm, Minor: {cur_minor:+.1f}mm)")
+
+                    # 把持マーカーを MuJoCo 上に表示更新
+                    r_phys_m = math.hypot(x_mm, y_mm) / 1000.0
+                    theta_phys_rad = math.atan2(y_mm, x_mm)
+                    sag_offset_m = calculate_sag_compensation(r_phys_m, theta_phys_rad)
+                    CURRENT_GRASP_TCP_MARKERS = {
+                        "target_tcp": np.array([-y_mm / 1000.0, -x_mm / 1000.0, cur_z / 1000.0]),
+                        "sag_tcp": np.array([-y_mm / 1000.0, -x_mm / 1000.0, (cur_z / 1000.0) - sag_offset_m])
+                    }
 
                     # 1. Pick 側 IK
                     ik_grasp, ik_pick_wp, _ = solve_ik_tabletop_grasp(
@@ -334,15 +408,11 @@ def main():
                         executor.move_to_rad(pick_grasp_close, duration_sec=0.5, send_to_real=True)
                         executor.move_to_rad(pick_wp_close, duration_sec=0.8, send_to_real=True)
 
-                        # ------------------------------------------------------
-                        # 👉 把持判定 (安定化待機 ＆ 複数回ポーリング)
-                        # ------------------------------------------------------
-                        time.sleep(0.2)  # 把持後の振動安定化
+                        # 把持判定
+                        time.sleep(0.2)
                         is_grasped = True
-                        
                         if executor.is_real_connected and hasattr(controller, 'driver') and controller.driver:
                             grip_raw = None
-                            # 最大 4 回ポーリングして確実に生値を取得
                             for _ in range(4):
                                 grip_raw = controller.driver.read_position(6)
                                 if grip_raw is not None:
@@ -352,18 +422,13 @@ def main():
                             if grip_raw is not None:
                                 raw_diff = abs(grip_raw - GRIPPER_CLOSED_RAW)
                                 print(f"   🔍 [把持判定] 現在爪 Raw: {grip_raw} (完全閉止値 1889 との差: {raw_diff} count)")
-
-                                # 完全閉止近傍 (±60 count 以内) なら空振りと判定
                                 if raw_diff <= EMPTY_GRASP_TOLERANCE_RAW:
                                     is_grasped = False
                             else:
-                                print("   ⚠️ サーボ ID 6 の位置読み取りに失敗しました (タイムアウト)。")
-                                is_grasped = False  # 安全のため読み取り失敗時も空振りとみなしてリトライへ
+                                print("   ⚠️ サーボ ID 6 の位置読み取りに失敗しました。")
+                                is_grasped = False
 
                         if is_grasped:
-                            # --------------------------------------------------
-                            # 1. 把持成功: Place エリアへ搬送 ➔ Home 復帰
-                            # --------------------------------------------------
                             OBJECT_FAIL_HISTORY.pop(obj_key, None)
                             executor.move_to_rad(place_wp_close, duration_sec=1.5, send_to_real=True)
                             executor.move_to_rad(place_land_close, duration_sec=0.8, send_to_real=True)
@@ -371,30 +436,25 @@ def main():
                             executor.move_to_rad(place_wp_open, duration_sec=0.8, send_to_real=True)
                             print("✨ 配置完了！")
 
-                            # 配置後は Home へ戻って次の物体探索へ
+                            CURRENT_GRASP_TCP_MARKERS = None
                             executor.move_to_home_and_wait(home_rad)
                             time.sleep(0.3)
                             state = "IDLE"
 
                         else:
-                            # --------------------------------------------------
-                            # 2. 把持失敗 (空振り): 上空で爪を開き、即時再トライ
-                            # --------------------------------------------------
                             new_fail_count = fail_count + 1
                             OBJECT_FAIL_HISTORY[obj_key] = new_fail_count
-                            print(f"⚠️️ 把持空振りを検知 (試行 {new_fail_count}/{MAX_RETRIES_PER_OBJECT})")
+                            print(f"⚠️ 把持空振りを検知 (試行 {new_fail_count}/{MAX_RETRIES_PER_OBJECT})")
 
-                            # 上空待機姿勢のまま、爪を静かに開く (0.4秒)
                             executor.move_to_rad(pick_wp_open, duration_sec=0.4, send_to_real=True)
 
                             if new_fail_count < MAX_RETRIES_PER_OBJECT:
-                                # 👉 【Home をスキップ】その場の上空から直ちに再トライ
                                 print("⚡ Home を経由せず、上空から即座にオフセット摂動をかけて再試行します...")
                                 time.sleep(0.2)
-                                state = "PLAN_AND_EXECUTE"  # 再度プラン＆実行へ直結
+                                state = "PLAN_AND_EXECUTE"
                             else:
-                                # 規定回数連続で失敗した場合のみ、Home へ戻ってスキップ
                                 print("🛑 連続失敗上限に達しました。Home へ戻り、別の物体へ切り替えます。")
+                                CURRENT_GRASP_TCP_MARKERS = None
                                 executor.move_to_home_and_wait(home_rad)
                                 time.sleep(0.5)
                                 state = "IDLE"
