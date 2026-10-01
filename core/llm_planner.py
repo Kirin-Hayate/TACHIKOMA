@@ -1,6 +1,6 @@
 """
 ==============================================================================
-TACHIKOMA 自然言語タスクプランナー (core/llm_planner.py)
+TACHIKOMA 自然言語タスクプランナー (マルチステップ・タスク分解対応版) (core/llm_planner.py)
 ==============================================================================
 【役割】
 ユーザーの自然言語指示を入力し、
@@ -54,26 +54,22 @@ class LLMTaskPlanner:
     ):
         self.api_key = api_key or os.getenv("GEMINI_API_KEY")
         if not self.api_key:
-            raise ValueError(
-                "❌ GEMINI_API_KEY が見つかりません。.env ファイルを確認してください。"
-            )
+            raise ValueError("❌ GEMINI_API_KEY が見つかりません。.env を確認してください。")
         self.client = genai.Client(api_key=self.api_key)
 
-        # multimodal_tagger.py と同様の優先度リスト
         if candidate_models is None:
             self.candidate_models = [
-                "gemini-3.8-flash",
                 "gemini-3.5-flash-lite",
-                "gemini-3.5-flash",
                 "gemini-3.1-flash-lite",
+                "gemini-3.5-flash",
+                "gemini-3.6-flash",
                 "gemini-3.7-flash",
-                "gemini-3.6-flash"
+                "gemini-3.8-flash"
             ]
         else:
             self.candidate_models = candidate_models
 
     def _load_current_world_state(self) -> Dict[str, Any]:
-        """最新の机上認識 JSON を読み込む"""
         if os.path.exists(WORLD_STATE_PATH):
             try:
                 with open(WORLD_STATE_PATH, "r", encoding="utf-8") as f:
@@ -83,76 +79,82 @@ class LLMTaskPlanner:
         return {"total_objects": 0, "objects": [], "workspace": {"place_area_xy_mm": [180.0, 160.0]}}
 
     def plan(self, user_instruction: str, world_state: Optional[Dict[str, Any]] = None) -> dict:
-        """
-        自然言語指示を入力し、タスクプラン (旧版完全互換辞書) を出力する。
-        """
         if world_state is None:
             world_state = self._load_current_world_state()
 
         system_instruction = (
             "あなたの名前は思考戦車『TACHIKOMA（タチコマ）』です。\n"
             "礼儀正しく、しかし親しみと愛嬌を持って応答します。一人称は『当機』を使用してください。\n\n"
-            "【機能概要】\n"
-            "あなたには単眼カメラおよびVLMによってリアルタイム認識された机上の物体リスト (world_state) が与えられます。\n"
-            "ユーザーからの自然言語指示を解釈し、雑談・挨拶なのか、それとも物体の搬送 (Pick & Place) なのかを判断してください。\n\n"
+            "【重要機能：マルチステップ・タスク分解】\n"
+            "ユーザーからの指示が複雑（例: '2つを右に、残りを左に'、'AをBの上に重ねて'、'すべて片付けて'）な場合、\n"
+            "決して拒絶したり会話で濁したりせず、複数の連続する基本搬送タスク (tasks リスト内の複数の要素) に論理的に分解して計画してください。\n\n"
             "【推論ルール】\n"
-            "1. 挨拶・雑談・感謝などの場合:\n"
-            "   - 感情豊かに礼儀正しく応答してください。\n"
-            "   - tasks リストは必ず空リスト [] にしてください。\n\n"
-            "2. 物体の搬送指示の場合:\n"
-            "   - ユーザーの曖昧な表現（例: '木製のやつ', '細長いもの', '右にあるもの', '消しゴム'）から、\n"
-            "     objects 内の display_name, category, color, description, spatial, physical を総合照合して最も適切な物体を1つ特定してください。\n"
-            "   - 物体の物理座標 [X_mm, Y_mm] を以下の計算式でロボット極座標に変換して pick に設定してください:\n"
-            "       r = hypot(X_mm, Y_mm) / 1000.0  (単位: m)\n"
-            "       theta_deg = degrees(atan2(Y_mm, X_mm))  (単位: 度、正が右/時計回り、負が左/反時計回り)\n"
-            "       z = DEFAULT_Z_TCP (通常 0.02m)\n"
-            "   - place には workspace.place_area_xy_mm (デフォルト [180.0, 160.0]) の極座標、またはユーザー指定位置を設定してください。\n"
-            "   - 指定の物体が見当たらない場合は tasks を [] とし、見つからない旨を reply_text で優しく伝えてください。"
+            "1. 挨拶・質問・雑談など、物理動作を伴わない場合のみ tasks=[] とし、愛嬌よく返答してください。\n"
+            "2. 搬送タスクの場合、実行順序を考え、tasks 配列に1つずつステップを格納してください。\n"
+            "3. 座標計算式:\n"
+            "   - r = hypot(X_mm, Y_mm) / 1000.0  [m]\n"
+            "   - theta_deg = degrees(atan2(Y_mm, X_mm))  [deg]\n"
+            "   - 通常の机上把持・配置の高さ z = 0.005 [m] (5mm)\n"
+            "4. スタッキング（積み重ね）のルール:\n"
+            "   - 物体Aの上に物体Bを重ねる場合、place 座標は物体Aの (X, Y) と同じ位置にし、\n"
+            "     z 座標は物体Aの厚み分高く設定してください (2段目: z = 0.025m, 3段目: z = 0.045m など)。\n"
+            "5. 仕分け・配置場所の目安:\n"
+            "   - 右側ゾーン: X=200mm, Y=140mm 付近 (r≈0.24m, θ≈+35°)\n"
+            "   - 左側ゾーン: X=200mm, Y=-140mm 付近 (r≈0.24m, θ≈-35°)\n"
+            "   - 指定排出エリア: workspace.place_area_xy_mm\n"
+            "   -ただし、プロンプト内で配送場所が示されている場合は、それに従うこと。\n"
+            "6. 各タスクには必ず操作対象の `target_id` を明記してください。"
         )
 
         prompt = f"""
-【現在の机上ワールドステート (実機カメラ認識結果)】
+【現在の机上ワールドステート】
 {json.dumps(world_state, ensure_ascii=False, indent=2)}
 
 【ロボット可動仕様】
 - 可動半径 r: {R_MIN_METERS}m 〜 {R_MAX_METERS}m
 - 旋回角 theta_deg: -90.0度 〜 +90.0度
-- 高さ z: 基準値 {DEFAULT_Z_TCP}m
+- 高さ z: 基準値 {DEFAULT_Z_TCP}m (スタック時は +0.02m ずつ加算)
 
 【ユーザー入力】
 "{user_instruction}"
 
 【出力 JSON フォーマット要件】
 {{
-  "thought": "指示の解釈、対象物体の特定根拠、座標計算の過程",
-  "reply_text": "タチコマらしい丁寧かつ愛嬌のある発話メッセージ (一人称: 当機)",
+  "thought": "指示の分解プロセス、対象物体の選定理由、各ステップの座標計算ログ",
+  "reply_text": "タチコマらしい丁寧で元気な発話メッセージ (一人称: 当機)",
   "tasks": [
     {{
       "type": "pick_and_place",
       "target_id": 0,
-      "description": "タスク要約 (例: 手前右の細長い白い定規を排出トレイへ搬送)",
-      "pick": {{"r": 0.243, "theta_deg": 21.6, "z": {DEFAULT_Z_TCP}}},
-      "place": {{"r": 0.241, "theta_deg": 41.6, "z": {DEFAULT_Z_TCP}}}
+      "description": "ステップ1: ブロック#0を手前右へ搬送",
+      "pick": {{"r": 0.312, "theta_deg": 26.5, "z": 0.005}},
+      "place": {{"r": 0.244, "theta_deg": 35.0, "z": 0.005}}
+    }},
+    {{
+      "type": "pick_and_place",
+      "target_id": 3,
+      "description": "ステップ2: ブロック#3をブロック#0の上にスタック",
+      "pick": {{"r": 0.404, "theta_deg": 15.3, "z": 0.005}},
+      "place": {{"r": 0.244, "theta_deg": 35.0, "z": 0.025}}
     }}
   ]
 }}
-※ 搬送不要な会話・挨拶の場合は tasks を必ず [] にしてください。
 """
 
-        # ----------------------------------------------------------------------
-        # 多重モデル ＆ 2回リトライ・フォールバックループ
-        # ----------------------------------------------------------------------
         last_error = None
         for model_name in self.candidate_models:
             for attempt in range(2):
                 try:
+                    # GenerateContentConfig の呼び出し部分
                     response = self.client.models.generate_content(
                         model=model_name,
                         contents=prompt,
                         config=types.GenerateContentConfig(
                             system_instruction=system_instruction,
                             response_mime_type="application/json",
-                            temperature=0.2
+                            temperature=0.2,
+                            # 👉 【追加】思考機能による無駄な長考をカット (即答させる)
+                            thinking_config=types.ThinkingConfig(thinking_budget=0)
                         )
                     )
 
@@ -164,7 +166,6 @@ class LLMTaskPlanner:
                             "tasks": plan_data
                         }
 
-                    # 座標値バリデーション ＆ 安全クランプ
                     raw_tasks = plan_data.get("tasks") or []
                     valid_tasks = []
 
@@ -174,7 +175,7 @@ class LLMTaskPlanner:
                                 coord = task[key]
                                 coord["r"] = float(max(R_MIN_METERS, min(R_MAX_METERS, coord.get("r", 0.25))))
                                 coord["theta_deg"] = float(max(-90.0, min(90.0, coord.get("theta_deg", 0.0))))
-                                coord["z"] = float(max(0.005, min(0.100, coord.get("z", DEFAULT_Z_TCP))))
+                                coord["z"] = float(max(0.005, min(0.120, coord.get("z", DEFAULT_Z_TCP))))
                             valid_tasks.append(task)
 
                     plan_data["tasks"] = valid_tasks
@@ -183,16 +184,13 @@ class LLMTaskPlanner:
                 except Exception as e:
                     last_error = e
                     err_msg = str(e)
-                    # 404 (廃止モデル) の場合は再試行せず即座に次のモデルへ
                     if "404" in err_msg or "NOT_FOUND" in err_msg:
                         break
-                    # 一時ビジー (503 等) の場合は少し待ってから同モデルで再試行
                     if attempt == 0 and ("503" in err_msg or "UNAVAILABLE" in err_msg):
                         time.sleep(1.0)
                     else:
                         break
 
-        # 全モデルが失敗した場合のエラーハンドリング
         if last_error:
             traceback.print_exc()
         return {

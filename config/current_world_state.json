@@ -1,28 +1,28 @@
 {
-  "timestamp": 1790864023.2246754,
+  "timestamp": 1790865480.2767203,
   "total_objects": 4,
   "objects": [
     {
       "id": 0,
-      "display_name": "natural wood wooden block",
-      "category": "wooden block",
-      "color": "natural wood",
-      "description": "wooden grain surface",
+      "display_name": "white ring",
+      "category": "ring",
+      "color": "white",
+      "description": "white plastic ring with patterned holes",
       "physical": {
         "position_xy_mm": [
-          279.0,
-          139.5
+          252.6,
+          24.7
         ],
         "size_mm": [
-          95.1,
-          42.0
+          96.0,
+          90.0
         ],
-        "angle_deg": 36.0,
-        "aspect_ratio": 2.26
+        "angle_deg": -14.0,
+        "aspect_ratio": 1.07
       },
       "spatial": {
-        "relative_position": "奥右",
-        "distance_to_base_mm": 311.9
+        "relative_position": "奥中央",
+        "distance_to_base_mm": 253.8
       }
     },
     {
@@ -30,45 +30,45 @@
       "display_name": "natural wood wooden block",
       "category": "wooden block",
       "color": "natural wood",
-      "description": "wooden grain surface",
+      "description": "rectangular wooden block with visible grain",
       "physical": {
         "position_xy_mm": [
-          287.0,
-          -69.8
+          293.8,
+          156.1
         ],
         "size_mm": [
-          93.3,
-          40.1
+          90.5,
+          43.5
         ],
-        "angle_deg": 45.6,
-        "aspect_ratio": 2.33
+        "angle_deg": -78.4,
+        "aspect_ratio": 2.08
       },
       "spatial": {
-        "relative_position": "奥左",
-        "distance_to_base_mm": 295.4
+        "relative_position": "奥右",
+        "distance_to_base_mm": 332.7
       }
     },
     {
       "id": 2,
-      "display_name": "natural wood wooden block",
-      "category": "wooden block",
-      "color": "natural wood",
-      "description": "wooden grain surface",
+      "display_name": "gold fidget spinner",
+      "category": "fidget spinner",
+      "color": "gold",
+      "description": "metallic finish triple-lobe fidget spinner",
       "physical": {
         "position_xy_mm": [
-          336.5,
-          22.9
+          360.3,
+          -27.1
         ],
         "size_mm": [
-          81.0,
-          27.0
+          81.9,
+          43.1
         ],
-        "angle_deg": 90.0,
-        "aspect_ratio": 3.0
+        "angle_deg": -80.3,
+        "aspect_ratio": 1.9
       },
       "spatial": {
         "relative_position": "奥中央",
-        "distance_to_base_mm": 337.3
+        "distance_to_base_mm": 361.3
       }
     },
     {
@@ -76,22 +76,22 @@
       "display_name": "natural wood wooden block",
       "category": "wooden block",
       "color": "natural wood",
-      "description": "wooden grain surface",
+      "description": "rectangular wooden block placed diagonally",
       "physical": {
         "position_xy_mm": [
-          390.0,
-          106.7
+          418.8,
+          87.0
         ],
         "size_mm": [
-          92.7,
-          44.7
+          84.1,
+          42.4
         ],
-        "angle_deg": 46.3,
-        "aspect_ratio": 2.07
+        "angle_deg": 45.0,
+        "aspect_ratio": 1.98
       },
       "spatial": {
         "relative_position": "奥右",
-        "distance_to_base_mm": 404.3
+        "distance_to_base_mm": 427.7
       }
     }
   ],

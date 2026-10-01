@@ -220,8 +220,15 @@ def scan_and_rebuild_world_state(
 # ==============================================================================
 # シミュレータプレビュー同期ルーチン
 # ==============================================================================
-def preview_task_in_sim(sim: MujocoSimViewer, executor: TrajectoryExecutor, target_obj: dict):
-    """MuJoCo シミュレータ上で把持〜配置の軌道を先行プレビュー再生する"""
+def preview_task_in_sim(
+    sim: MujocoSimViewer,
+    executor: TrajectoryExecutor,
+    target_obj: dict,
+    place_x_mm: float = PLACE_X_MM,
+    place_y_mm: float = PLACE_Y_MM,
+    place_z_mm: float = PLACE_Z_MM
+) -> bool:
+    """MuJoCo シミュレータ上で把持〜指定位置・高さへの配置軌道を先行プレビュー再生する"""
     x_mm, y_mm = target_obj["physical"]["position_xy_mm"]
     major_mm, minor_mm = target_obj["physical"]["size_mm"]
     angle_deg = target_obj["physical"]["angle_deg"]
@@ -234,7 +241,7 @@ def preview_task_in_sim(sim: MujocoSimViewer, executor: TrajectoryExecutor, targ
         verbose=False
     )
     ik_place_target, ik_place_wp, _ = solve_ik_tabletop_place(
-        x_phys_mm=PLACE_X_MM, y_phys_mm=PLACE_Y_MM, z_phys_mm=PLACE_Z_MM,
+        x_phys_mm=place_x_mm, y_phys_mm=place_y_mm, z_phys_mm=place_z_mm,
         place_angle_deg=PLACE_ANGLE_DEG, enable_sag_compensation=True,
         verbose=False
     )
@@ -243,7 +250,7 @@ def preview_task_in_sim(sim: MujocoSimViewer, executor: TrajectoryExecutor, targ
         print("⚠️ [IK 算出不能] プレビュー軌道を生成できませんでした。")
         return False
 
-    home_rad = get_home_radians()  
+    home_rad = get_home_radians()
     pick_wp_open = dict(ik_pick_wp); pick_wp_open[6] = GRIPPER_OPEN_RAD
     pick_grasp_open = dict(ik_grasp); pick_grasp_open[6] = GRIPPER_OPEN_RAD
     pick_grasp_close = dict(ik_grasp); pick_grasp_close[6] = GRIPPER_CLOSE_RAD
@@ -272,15 +279,18 @@ def preview_task_in_sim(sim: MujocoSimViewer, executor: TrajectoryExecutor, targ
 def execute_real_task_with_retry(
     executor: TrajectoryExecutor,
     controller: Optional[Any],
-    target_obj: dict
+    target_obj: dict,
+    place_x_mm: float = PLACE_X_MM,
+    place_y_mm: float = PLACE_Y_MM,
+    place_z_mm: float = PLACE_Z_MM
 ) -> bool:
     """実機サーボによる Pick & Place と空振り検知時の 6段階戦略的リトライ"""
     x_mm, y_mm = target_obj["physical"]["position_xy_mm"]
     major_mm, minor_mm = target_obj["physical"]["size_mm"]
     angle_deg = target_obj["physical"]["angle_deg"]
-    home_rad = get_home_radians()  
+    home_rad = get_home_radians()
 
-    print(f"\n🚀 実機タスク実行開始: [{target_obj['display_name']}]")
+    print(f"\n🚀 実機タスク実行開始: [{target_obj['display_name']}] ➔ 目標配置: ({place_x_mm:+.1f}, {place_y_mm:+.1f}, Z:{place_z_mm:.1f}mm)")
 
     for retry_count in range(MAX_RETRIES_PER_OBJECT):
         cur_major = MANUAL_OFFSET_MAJOR_MM
@@ -317,7 +327,7 @@ def execute_real_task_with_retry(
             verbose=False
         )
         ik_place_target, ik_place_wp, _ = solve_ik_tabletop_place(
-            x_phys_mm=PLACE_X_MM, y_phys_mm=PLACE_Y_MM, z_phys_mm=PLACE_Z_MM,
+            x_phys_mm=place_x_mm, y_phys_mm=place_y_mm, z_phys_mm=place_z_mm,
             place_angle_deg=PLACE_ANGLE_DEG, enable_sag_compensation=True,
             verbose=False
         )
@@ -361,7 +371,7 @@ def execute_real_task_with_retry(
                 is_grasped = False
 
         if is_grasped:
-            print("✨ 物体の把持に成功しました！トレイへ搬送します。")
+            print("✨ 物体の把持に成功しました！指定位置へ搬送します。")
             executor.move_to_rad(place_wp_close, duration_sec=1.5, send_to_real=True)
             executor.move_to_rad(place_land_close, duration_sec=0.8, send_to_real=True)
             executor.move_to_rad(place_land_open, duration_sec=0.5, send_to_real=True)
@@ -487,23 +497,73 @@ def main():
                 print("⚠️ タスク対象の物体データが机上に見当たりません。")
                 continue
 
-            # 3. 3D シミュレータプレビュー  
-            print("\n🖥️ 3Dシミュレータでプレビューを再生します...")  
-            preview_success = preview_task_in_sim(sim, executor, target_obj)
+            # ==================================================================
+            # 3. 3D シミュレータプレビュー (全タスク連続再生)
+            # ==================================================================
+            print(f"\n🖥️ 3Dシミュレータで全 {len(tasks)} 件のプレビューを順次再生します...")
+            all_preview_success = True
+            
+            for s_idx, task in enumerate(tasks, start=1):
+                tid = task.get("target_id")
+                # 対象物体の検索
+                t_obj = next((o for o in world_state.get("objects", []) if o["id"] == tid), None)
+                if t_obj is None:
+                    print(f"⚠️ [ステップ {s_idx}] 対象物体 (ID: {tid}) が見つかりません。")
+                    all_preview_success = False
+                    break
 
-            # 4. 実機承認実行  
-            if executor.is_real_connected and preview_success:
-                confirm = input("\n❓ このシーケンスを実機フォロワーで実行しますか？ [y/N] > ").strip().lower()  
-                if confirm == 'y':  
-                    execute_real_task_with_retry(executor, controller, target_obj)
-                    # 👉 【タスク完了後の机上自動再スキャン】
-                    print("\n🔄 物体配置の変化を検出するため、机上を自動再スキャンします...")
+                # place 座標の極座標 -> 直交座標への展開
+                pl_r = task["place"]["r"] * 1000.0
+                pl_th_rad = math.radians(task["place"]["theta_deg"])
+                pl_x = pl_r * math.cos(pl_th_rad)
+                pl_y = pl_r * math.sin(pl_th_rad)
+                pl_z = task["place"]["z"] * 1000.0
+
+                print(f"   ▶️ プレビュー [{s_idx}/{len(tasks)}]: {task.get('description', '')}")
+                # プレビュー関数にカスタム配置座標を渡す
+                ok = preview_task_in_sim(sim, executor, t_obj, place_x_mm=pl_x, place_y_mm=pl_y, place_z_mm=pl_z)
+                if not ok:
+                    all_preview_success = False
+                    break
+                time.sleep(0.3)
+
+            # ==================================================================
+            # 4. 実機承認 ＆ 連続シーケンス実行
+            # ==================================================================
+            if executor.is_real_connected and all_preview_success:
+                confirm = input(f"\n❓ 全 {len(tasks)} 件のシーケンスを実機フォロワーで実行しますか？ [y/N] > ").strip().lower()
+                if confirm == 'y':
+                    print("🤖 実機でマルチステップ連続実行を開始します...")
+                    for s_idx, task in enumerate(tasks, start=1):
+                        tid = task.get("target_id")
+                        t_obj = next((o for o in world_state.get("objects", []) if o["id"] == tid), None)
+                        if t_obj is None:
+                            print(f"⚠️ [ステップ {s_idx}] 対象物体が見つからないためスキップします。")
+                            continue
+
+                        pl_r = task["place"]["r"] * 1000.0
+                        pl_th_rad = math.radians(task["place"]["theta_deg"])
+                        pl_x = pl_r * math.cos(pl_th_rad)
+                        pl_y = pl_r * math.sin(pl_th_rad)
+                        pl_z = task["place"]["z"] * 1000.0
+
+                        print(f"\n--- 🎬 [実行 {s_idx}/{len(tasks)}] {task.get('description', '')} ---")
+                        success = execute_real_task_with_retry(
+                            executor, controller, t_obj,
+                            place_x_mm=pl_x, place_y_mm=pl_y, place_z_mm=pl_z
+                        )
+                        if not success:
+                            print(f"🛑 ステップ {s_idx} で失敗上限に達したため、安全のため後続タスクを中断します。")
+                            break
+                        time.sleep(0.5)
+
+                    print("\n✨ すべての実行が完了しました。机上を再スキャンして状態を更新します...")
                     world_state = scan_and_rebuild_world_state(cap, projector, detector, tagger)
                 else:
-                    print("🛑 実機実行をキャンセルしました。")  
+                    print("🛑 実機実行をキャンセルしました。")
             else:
-                if not executor.is_real_connected:
-                    print("ℹ️ 実機未接続のためプレビューのみで完了しました。")
+                if not executor.is_real_connected and all_preview_success:
+                    print("ℹ️ 実機未接続のためプレビュー完了として終了します。")
 
     except KeyboardInterrupt:
         print("\n\n終了します。")  
