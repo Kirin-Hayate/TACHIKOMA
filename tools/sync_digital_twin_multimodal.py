@@ -1,24 +1,26 @@
 """
 ==============================================================================
-マルチモーダル・デジタルツイン同期ツール (リファクタリング版)
+マルチモーダル・デジタルツイン同期 ＆ 机上ワールドステート生成システム
 (tools/sync_digital_twin_multimodal.py)
 ==============================================================================
 【機能】
-1. カメラ画像から全物体を OpenCV で検出し、物理座標・傾き・ミリ寸法を計測。
-2. [C] キー入力で全物体をコラージュ台紙化して VLM に一括推論リクエスト。
-3. 実行時引数に応じて推論エンジンを切り替え・フォールバック：
-   - --gemini        : Gemini API によるクラウド一括同定
-   - --qwen          : ローカル Ollama (qwen2.5vl:3b) による完全オフライン同定
-   - --gemini --qwen : Gemini 試行 ➔ 全モデル失敗時に Qwen へ自動フォールバック
-4. 計測されたミリ寸法 (長辺x短辺) に合わせて MuJoCo の直方体形状を動的変形。
-5. MuJoCo 画面上の各物体の直上に物体名ラベルを 3D オーバーレイ表示。
+1. カメラ画像から全物体を OpenCV で検出し、物理座標・傾き・ミリ寸法・アスペクト比を計測[cite: 4]。
+2. [C] キー入力で全物体をコラージュ台紙化し、VLM (Gemini / Qwen) へ一括推論リクエスト[cite: 4]。
+   - 物体カテゴリ、主要色、外観詳細（質感・特徴・状態）を動的同定[cite: 5]。
+3. 実行時引数に応じた推論エンジンの切り替え・自動フォールバック[cite: 4]：
+   - --gemini        : Gemini API によるクラウド一括同定[cite: 4]
+   - --qwen          : ローカル Ollama (qwen2.5vl:3b) による完全オフライン同定[cite: 4]
+   - --gemini --qwen : Gemini 試行 ➔ 全モデル失敗時に Qwen へ自動フォールバック[cite: 4]
+4. 計測されたミリ寸法に合わせて MuJoCo 上の直方体形状を動的変形し、3D ラベルを重畳表示[cite: 4]。
+5. 【LLM タスクプランナー連携】
+   - 検出した物理幾何情報と VLM の外観・属性推論結果を統合[cite: 4, 5]。
+   - 自然言語指示解釈用の構造化ファイル (config/current_world_state.json) を自動生成・保存。
 
 【操作】
-  - [C]     : 全物体を同定し MuJoCo に直方体形状＆ラベルを反映
-  - [B]     : 机面背景の記憶 (高精度差分)
-  - [SPACE] : マーカー正射影の再計算
-  - [Q/ESC] : 終了
-==============================================================================
+  - [C]     : 全物体を一括同定、MuJoCo 反映 ＆ ワールドステート JSON を出力[cite: 4]
+  - [B]     : 机面背景の記憶（高精度差分リフレッシュ）[cite: 4]
+  - [SPACE] : ArUco マーカーに基づく正射影キャリブレーションの再計算[cite: 4]
+  - [Q/ESC] : 終了[cite: 4]
 ==============================================================================
 """
 
@@ -31,6 +33,8 @@ import numpy as np
 import mujoco
 import mujoco.viewer
 from typing import Dict
+import time
+import json
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if BASE_DIR not in sys.path:
@@ -210,6 +214,49 @@ def main():
                     for idx, obj in enumerate(detected_objs):
                         name = object_profiles.get(idx, {}).get("display_name", "object")
                         print(f"  [#{idx}] {name} ({obj['size_mm'][0]}x{obj['size_mm'][1]}mm)")
+
+                    # ==============================================================
+                    # 👉 【ここを追加】LLM用の机上ワールドステート JSON を生成・保存
+                    # ==============================================================
+                    world_objects = []
+                    for idx, obj in enumerate(detected_objs):
+                        prof = object_profiles.get(idx, {})
+                        x_mm, y_mm = obj["phys_xy"]
+                        major_mm, minor_mm = obj["size_mm"]
+                        dist_to_base = math.hypot(x_mm, y_mm)
+
+                        world_objects.append({
+                            "id": idx,
+                            "display_name": prof.get("display_name", "object"),
+                            "category": prof.get("category", "object"),
+                            "color": prof.get("color", ""),
+                            "description": prof.get("description", ""),  # VLMが返した外観詳細
+                            "physical": {
+                                "position_xy_mm": [round(x_mm, 1), round(y_mm, 1)],
+                                "size_mm": [round(major_mm, 1), round(minor_mm, 1)],
+                                "angle_deg": round(obj["angle_deg"], 1),
+                                "aspect_ratio": round(major_mm / max(1.0, minor_mm), 2)
+                            },
+                            "spatial": {
+                                "relative_position": ("手前" if x_mm < 250 else "奥") + ("左" if y_mm < -50 else "右" if y_mm > 50 else "中央"),
+                                "distance_to_base_mm": round(dist_to_base, 1)
+                            }
+                        })
+
+                    world_state = {
+                        "timestamp": time.time(),
+                        "total_objects": len(world_objects),
+                        "objects": world_objects,
+                        "workspace": {
+                            "place_area_xy_mm": [180.0, 160.0]
+                        }
+                    }
+
+                    # 保存 (次のタスクプランナー LLM が読み込む用)
+                    output_json_path = os.path.join(BASE_DIR, "config", "current_world_state.json")
+                    with open(output_json_path, "w", encoding="utf-8") as f:
+                        json.dump(world_state, f, ensure_ascii=False, indent=2)
+                    print(f"📄 [World State] LLM 用の机上状態ファイルを保存しました: {output_json_path}")
 
             # 3. OpenCV 描画
             annotated = detector.draw_annotations(warped, detected_objs, object_profiles)

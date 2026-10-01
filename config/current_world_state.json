@@ -1,0 +1,104 @@
+{
+  "timestamp": 1790862054.2228703,
+  "total_objects": 4,
+  "objects": [
+    {
+      "id": 0,
+      "display_name": "natural wood eraser",
+      "category": "eraser",
+      "color": "natural wood",
+      "description": "wooden block eraser with a brush edge",
+      "physical": {
+        "position_xy_mm": [
+          230.4,
+          -50.1
+        ],
+        "size_mm": [
+          85.8,
+          31.1
+        ],
+        "angle_deg": -13.3,
+        "aspect_ratio": 2.76
+      },
+      "spatial": {
+        "relative_position": "手前左",
+        "distance_to_base_mm": 235.8
+      }
+    },
+    {
+      "id": 1,
+      "display_name": "white ruler",
+      "category": "ruler",
+      "color": "white",
+      "description": "ruler wrapped in transparent plastic",
+      "physical": {
+        "position_xy_mm": [
+          225.9,
+          89.6
+        ],
+        "size_mm": [
+          135.2,
+          30.2
+        ],
+        "angle_deg": 45.6,
+        "aspect_ratio": 4.48
+      },
+      "spatial": {
+        "relative_position": "手前右",
+        "distance_to_base_mm": 243.0
+      }
+    },
+    {
+      "id": 2,
+      "display_name": "gold fidget spinner",
+      "category": "fidget spinner",
+      "color": "gold",
+      "description": "metallic finish three-pronged spinner",
+      "physical": {
+        "position_xy_mm": [
+          296.5,
+          157.3
+        ],
+        "size_mm": [
+          72.8,
+          55.9
+        ],
+        "angle_deg": 60.7,
+        "aspect_ratio": 1.3
+      },
+      "spatial": {
+        "relative_position": "奥右",
+        "distance_to_base_mm": 335.6
+      }
+    },
+    {
+      "id": 3,
+      "display_name": "black mouse",
+      "category": "mouse",
+      "color": "black",
+      "description": "compact wireless mouse",
+      "physical": {
+        "position_xy_mm": [
+          366.5,
+          -1.3
+        ],
+        "size_mm": [
+          96.2,
+          55.0
+        ],
+        "angle_deg": -26.6,
+        "aspect_ratio": 1.75
+      },
+      "spatial": {
+        "relative_position": "奥中央",
+        "distance_to_base_mm": 366.5
+      }
+    }
+  ],
+  "workspace": {
+    "place_area_xy_mm": [
+      180.0,
+      160.0
+    ]
+  }
+}

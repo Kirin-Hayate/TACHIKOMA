@@ -181,8 +181,9 @@ class MultimodalTagger:
 
         prompt = (
             f"This composite image contains {num_items} tabletop object crops arranged in a grid (#0, #1, ...).\n"
-            "Identify each item's canonical category name (e.g. 'pen', 'wooden block', 'eraser', 'mouse', 'ruler') "
-            "and primary dominant color (e.g. 'red', 'blue', 'silver', 'black', 'natural wood').\n"
+            "Identify each item's canonical category name (e.g. 'pen', 'wooden block', 'eraser', 'mouse', 'ruler'), "
+            "primary dominant color (e.g. 'red', 'blue', 'silver', 'black', 'natural wood'), "
+            "and a concise visual description including texture, markings, or state (e.g. 'striped pattern', 'wooden grain', 'metallic finish').\n"  # 👈 ここを追加
             "Return structured JSON matching the schema."
         )
 
