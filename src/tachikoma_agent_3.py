@@ -392,7 +392,123 @@ def execute_real_task_with_retry(
 
     return False
 
+def draw_aruco_markers_in_mujoco(sim: MujocoSimViewer, projector: VisionProjector, marker_size_m: float = 0.04):
+    """MuJoCo シーン上に 4隅の ArUco マーカー四角形と番号ラベルを描画"""
+    if sim.viewer is None:
+        return
+    half_s = marker_size_m / 2.0
+    half_th = 0.0002
 
+    for marker_idx in range(4):
+        phys_x, phys_y = projector.marker_phys_xy[marker_idx] 
+        mj_x = -phys_y / 1000.0 
+        mj_y = -phys_x / 1000.0 
+
+        # 1. マーカー板ジオメトリ
+        if sim.viewer.user_scn.ngeom < sim.viewer.user_scn.maxgeom:
+            ng = sim.viewer.user_scn.ngeom 
+            mujoco.mjv_initGeom(
+                sim.viewer.user_scn.geoms[ng],
+                type=mujoco.mjtGeom.mjGEOM_BOX,
+                size=np.array([half_s, half_s, half_th], dtype=np.float64),
+                pos=np.array([mj_x, mj_y, half_th], dtype=np.float64),
+                mat=np.eye(3).flatten(),
+                rgba=np.array([0.9, 0.9, 0.9, 0.95], dtype=np.float32)
+            ) 
+            sim.viewer.user_scn.ngeom += 1 
+
+        # 2. マーカー番号ラベル
+        if sim.viewer.user_scn.ngeom < sim.viewer.user_scn.maxgeom:
+            ng = sim.viewer.user_scn.ngeom 
+            lbl_pos = np.array([mj_x, mj_y, 0.025], dtype=np.float64) 
+            mujoco.mjv_initGeom(
+                sim.viewer.user_scn.geoms[ng],
+                type=mujoco.mjtGeom.mjGEOM_LABEL,
+                size=np.zeros(3),
+                pos=lbl_pos,
+                mat=np.eye(3).flatten(),
+                rgba=np.array([0.3, 0.8, 1.0, 1.0], dtype=np.float32)
+            ) 
+            sim.viewer.user_scn.geoms[ng].label = f"ArUco #{marker_idx}".encode("utf-8") 
+            sim.viewer.user_scn.ngeom += 1 
+
+
+def sync_world_state_to_mujoco(sim: MujocoSimViewer, projector: VisionProjector, world_state: dict):
+    """
+    スキャン結果のワールドステート（物体座標・寸法・ID・ラベル）および
+    ArUcoマーカーを MuJoCo 画面へ user_scn 経由で直接 3D 描画する
+    """
+    if sim.viewer is None:
+        return
+
+    # ユーザー描画ジオメトリ（マーカー・ブロック・ラベル等）を一度クリア
+    sim.viewer.user_scn.ngeom = 0 
+
+    # 1. 4隅 ArUco マーカーの描画 (板 + 水色ラベル)
+    draw_aruco_markers_in_mujoco(sim, projector, marker_size_m=0.04) 
+
+    # 2. 検出物体の直方体 (BOX) と 3D テキストラベルを描画
+    objects = world_state.get("objects", []) 
+    for obj in objects:
+        x_mm, y_mm = obj["physical"]["position_xy_mm"] 
+        major_mm, minor_mm = obj["physical"]["size_mm"] 
+        angle_deg = obj["physical"]["angle_deg"] 
+        display_name = obj.get("display_name", f"obj_{obj['id']}") 
+
+        # ロボット物理座標系から MuJoCo 座標系への変換
+        mj_x = -y_mm / 1000.0 
+        mj_y = -x_mm / 1000.0 
+        yaw_rad = math.radians(-angle_deg) 
+
+        # 寸法設定 (ハーフサイズ: m 単位)
+        half_x = max(0.005, (major_mm / 1000.0) / 2.0) 
+        half_y = max(0.005, (minor_mm / 1000.0) / 2.0) 
+        half_z = HALF_Z 
+
+        # 回転行列の計算 (Z軸周りのヨー回転)
+        cos_y = math.cos(yaw_rad)
+        sin_y = math.sin(yaw_rad)
+        rot_mat = np.array([
+            cos_y, -sin_y, 0.0,
+            sin_y,  cos_y, 0.0,
+            0.0,    0.0,   1.0
+        ], dtype=np.float64)
+
+        # --------------------------------------------------------------
+        # ① 物体そのものの 3D 直方体を描画 (半透明の木目調/オレンジ色)
+        # --------------------------------------------------------------
+        if sim.viewer.user_scn.ngeom < sim.viewer.user_scn.maxgeom:
+            ng = sim.viewer.user_scn.ngeom 
+            mujoco.mjv_initGeom(
+                sim.viewer.user_scn.geoms[ng],
+                type=mujoco.mjtGeom.mjGEOM_BOX,
+                size=np.array([half_x, half_y, half_z], dtype=np.float64),
+                pos=np.array([mj_x, mj_y, half_z], dtype=np.float64),
+                mat=rot_mat.flatten(),
+                rgba=np.array([0.9, 0.6, 0.2, 0.85], dtype=np.float32)  # 視認性の良い色
+            )
+            sim.viewer.user_scn.ngeom += 1 
+
+        # --------------------------------------------------------------
+        # ② 物体直上に [ID] 物体名 の 3D テキストラベルを描画
+        # --------------------------------------------------------------
+        if sim.viewer.user_scn.ngeom < sim.viewer.user_scn.maxgeom:
+            ng = sim.viewer.user_scn.ngeom 
+            label_pos = np.array([mj_x, mj_y, half_z * 2 + 0.035], dtype=np.float64)
+            mujoco.mjv_initGeom(
+                sim.viewer.user_scn.geoms[ng],
+                type=mujoco.mjtGeom.mjGEOM_LABEL,
+                size=np.zeros(3),
+                pos=label_pos,
+                mat=np.eye(3).flatten(),
+                rgba=np.array([1.0, 0.9, 0.1, 1.0], dtype=np.float32)  # 黄色
+            ) 
+            label_text = f"[#{obj['id']}] {display_name}" 
+            sim.viewer.user_scn.geoms[ng].label = label_text.encode("utf-8") 
+            sim.viewer.user_scn.ngeom += 1 
+
+    # 画面更新を適用
+    sim.viewer.sync() 
 # ==============================================================================
 # メイン対話ループ
 # ==============================================================================
@@ -421,13 +537,33 @@ def main():
             print(f"⚠️ 実機接続エラー: {e}")
             controller = None
 
+    # 1. シミュレータ初期化
     sim = MujocoSimViewer()
-    home_rad = get_home_radians()  
+    home_rad = get_home_radians()
     try:
         sim.update_joints_rad(home_rad)
     except Exception:
         pass
-    sim.viewer = mujoco.viewer.launch_passive(sim.model, sim.data)
+    sim.viewer = mujoco.viewer.launch_passive(sim.model, sim.data) 
+
+    # 👉 【追加】シーン内の物体スロットアドレスを解決
+    slot_info = []
+    for i in range(MAX_SLOTS):
+        bname = f"obj_block_{i}" 
+        gname = f"geom_obj_{i}" 
+        bid = mujoco.mj_name2id(sim.model, mujoco.mjtObj.mjOBJ_BODY, bname) 
+        gid = mujoco.mj_name2id(sim.model, mujoco.mjtObj.mjOBJ_GEOM, gname) 
+        if bid == -1:
+            bid = mujoco.mj_name2id(sim.model, mujoco.mjtObj.mjOBJ_BODY, f"jenga_block_{i}") 
+            if bid != -1:
+                gid = sim.model.body_geomadr[bid] 
+
+        qpos_adr = None
+        if bid != -1:
+            jnt_adr = sim.model.body_jntadr[bid] 
+            if jnt_adr != -1:
+                qpos_adr = sim.model.jnt_qposadr[jnt_adr] 
+        slot_info.append({"bid": bid, "gid": gid, "qpos_adr": qpos_adr}) 
 
     executor = TrajectoryExecutor(sim=sim, servo_controller=controller)
     if executor.is_real_connected:
@@ -447,15 +583,17 @@ def main():
     planner = LLMTaskPlanner()
 
     # 起動時の初期スキャン
-    world_state = scan_and_rebuild_world_state(cap, projector, detector, tagger)
+    world_state = scan_and_rebuild_world_state(cap, projector, detector, tagger) 
+    sync_world_state_to_mujoco(sim, projector, world_state)  # 👈 slot_info を外す
 
     try:
         while True:
             user_msg = input("\n🗣️ 指示を入力 (再スキャン: r / 終了: q) > ").strip()  
             if user_msg.lower() in ['q', 'quit', 'exit']:  
-                break
+                break 
             if user_msg.lower() == 'r':
                 world_state = scan_and_rebuild_world_state(cap, projector, detector, tagger)
+                sync_world_state_to_mujoco(sim, projector, world_state) # 👈 ここも追加
                 continue
             if not user_msg:  
                 continue
@@ -559,6 +697,7 @@ def main():
 
                     print("\n✨ すべての実行が完了しました。机上を再スキャンして状態を更新します...")
                     world_state = scan_and_rebuild_world_state(cap, projector, detector, tagger)
+                    sync_world_state_to_mujoco(sim, projector, world_state)
                 else:
                     print("🛑 実機実行をキャンセルしました。")
             else:

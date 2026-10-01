@@ -1,97 +1,97 @@
 {
-  "timestamp": 1790865480.2767203,
+  "timestamp": 1790870834.5640526,
   "total_objects": 4,
   "objects": [
     {
       "id": 0,
-      "display_name": "white ring",
-      "category": "ring",
-      "color": "white",
-      "description": "white plastic ring with patterned holes",
+      "display_name": "pink wooden block",
+      "category": "wooden block",
+      "color": "pink",
+      "description": "wooden block with a sun illustration on a pink background",
       "physical": {
         "position_xy_mm": [
-          252.6,
-          24.7
+          187.9,
+          -104.7
         ],
         "size_mm": [
-          96.0,
-          90.0
+          55.4,
+          53.1
         ],
-        "angle_deg": -14.0,
-        "aspect_ratio": 1.07
+        "angle_deg": -17.8,
+        "aspect_ratio": 1.04
       },
       "spatial": {
-        "relative_position": "奥中央",
-        "distance_to_base_mm": 253.8
+        "relative_position": "手前左",
+        "distance_to_base_mm": 215.1
       }
     },
     {
       "id": 1,
-      "display_name": "natural wood wooden block",
+      "display_name": "blue wooden block",
       "category": "wooden block",
-      "color": "natural wood",
-      "description": "rectangular wooden block with visible grain",
+      "color": "blue",
+      "description": "wooden block with a giraffe illustration on a blue background",
       "physical": {
         "position_xy_mm": [
-          293.8,
-          156.1
+          223.5,
+          -16.7
         ],
         "size_mm": [
-          90.5,
-          43.5
+          57.1,
+          52.2
         ],
-        "angle_deg": -78.4,
-        "aspect_ratio": 2.08
+        "angle_deg": -22.6,
+        "aspect_ratio": 1.09
       },
       "spatial": {
-        "relative_position": "奥右",
-        "distance_to_base_mm": 332.7
+        "relative_position": "手前中央",
+        "distance_to_base_mm": 224.1
       }
     },
     {
       "id": 2,
-      "display_name": "gold fidget spinner",
-      "category": "fidget spinner",
-      "color": "gold",
-      "description": "metallic finish triple-lobe fidget spinner",
+      "display_name": "blue wooden block",
+      "category": "wooden block",
+      "color": "blue",
+      "description": "wooden block with a giraffe illustration on a blue background",
       "physical": {
         "position_xy_mm": [
-          360.3,
-          -27.1
+          263.6,
+          -118.2
         ],
         "size_mm": [
-          81.9,
-          43.1
+          57.9,
+          50.0
         ],
-        "angle_deg": -80.3,
-        "aspect_ratio": 1.9
+        "angle_deg": 5.2,
+        "aspect_ratio": 1.16
       },
       "spatial": {
-        "relative_position": "奥中央",
-        "distance_to_base_mm": 361.3
+        "relative_position": "奥左",
+        "distance_to_base_mm": 288.9
       }
     },
     {
       "id": 3,
-      "display_name": "natural wood wooden block",
+      "display_name": "pink wooden block",
       "category": "wooden block",
-      "color": "natural wood",
-      "description": "rectangular wooden block placed diagonally",
+      "color": "pink",
+      "description": "wooden block with a sun illustration on a pink background",
       "physical": {
         "position_xy_mm": [
-          418.8,
-          87.0
+          291.6,
+          -24.9
         ],
         "size_mm": [
-          84.1,
-          42.4
+          57.9,
+          52.0
         ],
-        "angle_deg": 45.0,
-        "aspect_ratio": 1.98
+        "angle_deg": -10.9,
+        "aspect_ratio": 1.11
       },
       "spatial": {
-        "relative_position": "奥右",
-        "distance_to_base_mm": 427.7
+        "relative_position": "奥中央",
+        "distance_to_base_mm": 292.7
       }
     }
   ],
