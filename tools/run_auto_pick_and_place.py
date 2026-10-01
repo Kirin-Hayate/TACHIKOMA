@@ -82,9 +82,9 @@ MANUAL_OFFSET_MAJOR_MM = -15.0   # 長い辺オフセット
 MANUAL_OFFSET_MINOR_MM = -50.0   # 短い辺オフセット
 
 # 配置 (Place) エリア設定 (机上右側手前)
-PLACE_X_MM = 215.0               # 配置目標 X (mm)
-PLACE_Y_MM = 140.0               # 配置目標 Y (mm)
-PLACE_Z_MM = 120.0                # 配置解放高度
+PLACE_X_MM = 270.0               # 配置目標 X (mm)
+PLACE_Y_MM = 145.0               # 配置目標 Y (mm)
+PLACE_Z_MM = 35.0                # 配置解放高度
 PLACE_ANGLE_DEG = 33.0            # 配置時の手首角度
 
 # 基準把持高度 (机面 +2mm)

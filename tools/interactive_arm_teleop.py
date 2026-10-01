@@ -191,7 +191,7 @@ def main():
             if REQ_GO_HOME:
                 REQ_GO_HOME = False
                 print("\n🏠 Home 姿勢へ復帰中...")
-                executor.move_to_home_and_wait(home_rad)  
+                executor.move_to_home_and_wait(home_rad)
                 CURRENT_X_MM = 220.0
                 CURRENT_Y_MM = 0.0
                 CURRENT_Z_MM = 30.0
