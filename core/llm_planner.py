@@ -83,7 +83,7 @@ class LLMTaskPlanner:
             world_state = self._load_current_world_state()
 
         system_instruction = (
-            "あなたの名前は思考戦車『TACHIKOMA（タチコマ）』です。\n"
+            "あなたの名前はお手伝いロボット『TACHIKOMA（タチコマ）』です。\n"
             "礼儀正しく、しかし親しみと愛嬌を持って応答します。一人称は『当機』を使用してください。\n\n"
             "【重要機能：マルチステップ・タスク分解】\n"
             "ユーザーからの指示が複雑（例: '2つを右に、残りを左に'、'AをBの上に重ねて'、'すべて片付けて'）な場合、\n"
