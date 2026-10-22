@@ -32,7 +32,12 @@ import os
 import math
 from typing import Dict, Optional, Tuple
 import numpy as np
-import mujoco
+try:
+    import mujoco
+    HAS_MUJOCO = True
+except Exception:
+    mujoco = None
+    HAS_MUJOCO = False
 
 from config.joint_config import (
     SERVO_IDS,
