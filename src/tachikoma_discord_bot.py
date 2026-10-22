@@ -146,7 +146,7 @@ def execute_tasks_sync(tasks):
 class TaskConfirmView(View):
     """Discord UI ボタン（実行 / キャンセル）"""
     def __init__(self, tasks, user_id):
-        super().__init__(timeout=60.0)
+        super().__init__(timeout=120.0)
         self.tasks = tasks
         self.user_id = user_id
 
@@ -161,14 +161,21 @@ class TaskConfirmView(View):
             await interaction.response.send_message("⚠️ 現在別のアクションを実行中です。", ephemeral=True)
             return
 
+        # 💡 1. 3秒ルール回避のため、最優先で受付完了(defer)を送信
+        await interaction.response.defer()
+
         is_busy = True
         for child in self.children:
             child.disabled = True
-        await interaction.response.edit_message(content="🦾 **TACHIKOMA が物理タスクを実行中...**", view=self)
 
+        # 💡 2. defer 後は interaction.edit_original_response() でメッセージを更新
+        await interaction.edit_original_response(content="🦾 **TACHIKOMA が物理タスクを実行中...**", view=self)
+
+        # 💡 3. 実機搬送タスクを別スレッドで実行
         result_msg = await asyncio.to_thread(execute_tasks_sync, self.tasks)
         is_busy = False
 
+        # 💡 4. 結果通知を followup で送信
         await interaction.followup.send(result_msg)
 
     @discord.ui.button(label="キャンセル", style=discord.ButtonStyle.secondary, emoji="⏹️")
@@ -177,10 +184,12 @@ class TaskConfirmView(View):
             await interaction.response.send_message("❌ 指示を出した本人のみ操作できます。", ephemeral=True)
             return
 
+        # 💡 3秒ルール回避
+        await interaction.response.defer()
+
         for child in self.children:
             child.disabled = True
-        await interaction.response.edit_message(content="🛑 **タスクをキャンセルしました。**", view=self)
-
+        await interaction.edit_original_response(content="🛑 **タスクをキャンセルしました。**", view=self)
 
 @bot.event
 async def on_ready():
