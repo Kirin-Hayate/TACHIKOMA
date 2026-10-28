@@ -683,36 +683,41 @@ class SystemControlView(View):
     @discord.ui.button(label="📸 撮影", style=discord.ButtonStyle.secondary, custom_id="sys_cam_snap", row=0)
     async def snap_camera(self, interaction: discord.Interaction, button: Button):
         dlog("UI_BTN", f"[📸 撮影] が押されました (User: {interaction.user})", "INFO")
-        await interaction.response.defer()
-        status_msg = await interaction.followup.send("📸 **カメラからスナップショットを撮影中...**", wait=True)
+        await interaction.response.send_message("📸 **カメラ撮影を開始しました...**")
 
-        jpg_bytes, err = await asyncio.to_thread(capture_jpeg_frame_sync, True)
-        if err or not jpg_bytes:
-            await status_msg.edit(content=f"⚠️ **撮影失敗**: {err}")
-            return
+        async with interaction.channel.typing():
+            jpg_bytes, err = await asyncio.to_thread(capture_jpeg_frame_sync, True)
+            if err or not jpg_bytes:
+                await interaction.followup.send(f"⚠️ **撮影失敗**: {err}")
+                return
+            file = discord.File(io.BytesIO(jpg_bytes), filename="snapshot.jpg")
 
-        file = discord.File(io.BytesIO(jpg_bytes), filename="snapshot.jpg")
         dlog("UI_BTN", "スナップショット撮影・Discord送信完了", "OK")
-        await status_msg.edit(content="📸 **現在のカメラ視界**", attachments=[file])
+        await interaction.followup.send("✅ **現在のカメラ視界**", file=file)
 
     @discord.ui.button(label="🧠 AI診断", style=discord.ButtonStyle.primary, custom_id="sys_ai_diag", row=0)
     async def ai_diagnosis(self, interaction: discord.Interaction, button: Button):
         dlog("UI_BTN", f"[🧠 AI診断] が押されました (User: {interaction.user})", "INFO")
-        await interaction.response.defer()
-
-        # スマホ側で進行状況がひと目で分かるように進捗メッセージを出し、随時書き換える
-        progress_msg = await interaction.followup.send(
-            "📊 **[1/2] 7系統のシステム・セキュリティメトリクスを収集中...**",
-            wait=True,
-        )
 
         if not GEMINI_API_KEY:
-            await progress_msg.edit(content="❌ `.env` に `GEMINI_API_KEY` が設定されていません。")
+            await interaction.response.send_message("❌ `.env` に `GEMINI_API_KEY` が設定されていません。", ephemeral=True)
             return
 
+        # 1. ボタン押下直後に「開始メッセージ」を即座に確定返信する
+        await interaction.response.send_message(
+            "🧠 **AIセキュリティ診断を開始しました。**\n"
+            "7系統のシステムログ収集とGeminiによる解析を行っています。完了まで数秒お待ちください..."
+        )
+
         t0 = time.time()
-        raw_metrics = await asyncio.to_thread(collect_7_security_metrics_sync)
-        prompt = f"""
+        diag_text = None
+        used_model = "Failed"
+        errors = []
+
+        # 2. 診断処理が終わるまで「TACHIKOMA が入力中...」を表示し続ける
+        async with interaction.channel.typing():
+            raw_metrics = await asyncio.to_thread(collect_7_security_metrics_sync)
+            prompt = f"""
 あなたはLinuxサーバー（Ubuntu 24.04 / Tailscale環境）の専属セキュリティ・インフラ診断AIです。
 以下の7系統の実測テレメトリデータを分析し、スマホ画面で読みやすいよう簡潔な日本語の箇条書きで診断結果を出力してください。
 
@@ -726,30 +731,20 @@ class SystemControlView(View):
 {raw_metrics}
 """
 
-        diag_text = None
-        used_model = "Failed"
-        errors = []
-
-        for idx, model_name in enumerate(GEMINI_MODEL_CASCADE, 1):
-            await progress_msg.edit(
-                content=(
-                    f"🧠 **[2/2] Gemini AI でセキュリティ診断を実行中...**\n"
-                    f"・試行モデル ({idx}/{len(GEMINI_MODEL_CASCADE)}): `{model_name}` (Thinking OFF / 高速モード)"
-                )
-            )
-            dlog("AI_DIAG", f"Gemini API 呼び出し試行中... (Model: {model_name})", "INFO")
-            m_start = time.time()
-            try:
-                diag_text = await asyncio.to_thread(call_single_gemini_model_sync, model_name, prompt)
-                used_model = model_name
-                elapsed_m = time.time() - m_start
-                dlog("AI_DIAG", f"Gemini 診断成功! (Model: {model_name}, 所要時間: {elapsed_m:.2f}秒)", "OK")
-                break
-            except Exception as e:
-                elapsed_m = time.time() - m_start
-                short_reason = str(e).splitlines()[0][:120]
-                derr("AI_DIAG", f"モデル '{model_name}' 失敗 ({elapsed_m:.2f}秒) -> 次のモデルへ即時フォールバックします", e, show_tb=False)
-                errors.append(f"• `{model_name}`: {short_reason}")
+            for model_name in GEMINI_MODEL_CASCADE:
+                dlog("AI_DIAG", f"Gemini API 呼び出し試行中... (Model: {model_name})", "INFO")
+                m_start = time.time()
+                try:
+                    diag_text = await asyncio.to_thread(call_single_gemini_model_sync, model_name, prompt)
+                    used_model = model_name
+                    elapsed_m = time.time() - m_start
+                    dlog("AI_DIAG", f"Gemini 診断成功! (Model: {model_name}, 所要時間: {elapsed_m:.2f}秒)", "OK")
+                    break
+                except Exception as e:
+                    elapsed_m = time.time() - m_start
+                    short_reason = str(e).splitlines()[0][:120]
+                    derr("AI_DIAG", f"モデル '{model_name}' 失敗 ({elapsed_m:.2f}秒) -> 次のモデルへ即時フォールバックします", e, show_tb=False)
+                    errors.append(f"• `{model_name}`: {short_reason}")
 
         total_sec = time.time() - t0
         if diag_text is None:
@@ -764,7 +759,9 @@ class SystemControlView(View):
         embed.set_footer(
             text=f"使用モデル: {used_model} | 処理時間: {total_sec:.1f}秒 | 対象: ①通信 ②認証 ③PS ④SVC ⑤sudo ⑥エラー ⑦温度/SSD"
         )
-        await progress_msg.edit(content="✅ **AIセキュリティ診断が完了しました**", embed=embed)
+
+        # 3. 入力中表示が消えると同時に、診断結果レポートを新しいメッセージとして送信
+        await interaction.followup.send(content="✅ **AIセキュリティ診断が完了しました！**", embed=embed)
 
     @discord.ui.button(label="🛑 アーム", style=discord.ButtonStyle.danger, custom_id="sys_stop_arm", row=1)
     async def stop_arm(self, interaction: discord.Interaction, button: Button):
