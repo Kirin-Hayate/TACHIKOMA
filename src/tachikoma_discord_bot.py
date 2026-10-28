@@ -551,28 +551,29 @@ def collect_7_security_metrics_sync():
 
 def call_single_gemini_model_sync(model_name: str, prompt: str) -> str:
     """
-    指定した単一モデルに対して、内部自動リトライ(tenacity)を無効化 ＆ Thinking OFF で高速リクエストを送る。
-    失敗時は86秒待たずに即座に例外を投げて次のモデルへフォールバックさせる。
+    指定した単一モデルに対して、内部自動リトライ(tenacity)を無効化して高速リクエストを送る。
+    Thinking非対応モデル(400 INVALID_ARGUMENT等)にも安全にフォールバックし、
+    失敗時は86秒待たずに即座に例外を投げて次のモデルへ移行させる。
     """
     from google import genai
     from google.genai import types
 
-    # SDK内部の自動リトライ(最大5回・約86秒の待機)を無効化(attempts=1)し、タイムアウトを15秒に制限
+    # 1. タイムアウトを20秒に設定し、SDK内部の自動リトライ(tenacity)を無効化(attempts=1)
     http_opts = None
     try:
         http_opts = types.HttpOptions(
-            timeout=15000,  # 15秒 (ミリ秒指定)
+            timeout=20000,  # 20秒 (ミリ秒指定: 504タイムアウト緩和)
             retry_options=types.HttpRetryOptions(attempts=1),
         )
     except Exception:
         try:
-            http_opts = types.HttpOptions(timeout=15000)
+            http_opts = types.HttpOptions(timeout=20000)
         except Exception:
             http_opts = None
 
     client = genai.Client(api_key=GEMINI_API_KEY, http_options=http_opts) if http_opts else genai.Client(api_key=GEMINI_API_KEY)
 
-    # Thinkingモードを明示的にOFF (thinking_budget=0) にして応答速度を最大化
+    # 2. 基本コンフィグ（Thinking対応モデル用の思考無効化設定）
     gen_config = None
     try:
         gen_config = types.GenerateContentConfig(
@@ -580,16 +581,22 @@ def call_single_gemini_model_sync(model_name: str, prompt: str) -> str:
             temperature=0.2,
         )
     except Exception:
-        gen_config = None
+        try:
+            gen_config = types.GenerateContentConfig(temperature=0.2)
+        except Exception:
+            gen_config = None
 
+    # 3. 呼び出し試行（400 INVALID_ARGUMENT や thinking非対応時は即座に素の設定で再試行）
     try:
         if gen_config is not None:
             resp = client.models.generate_content(model=model_name, contents=prompt, config=gen_config)
         else:
             resp = client.models.generate_content(model=model_name, contents=prompt)
     except Exception as first_err:
-        # モデルが thinking_config 未対応だった場合のみ config なしで1回だけ即時呼び出し
-        if "thinking" in str(first_err).lower():
+        err_str = str(first_err).lower()
+        # 400エラー (INVALID_ARGUMENT) や thinking 関連エラーなら、configを完全排除して素の呼び出しで即時再送
+        if "invalid_argument" in err_str or "400" in err_str or "thinking" in err_str:
+            dlog("AI_DIAG", f"モデル '{model_name}' はthinking_config非対応(400等)のため、素のconfigで即時再試行します", "DEBUG")
             resp = client.models.generate_content(model=model_name, contents=prompt)
         else:
             raise first_err
