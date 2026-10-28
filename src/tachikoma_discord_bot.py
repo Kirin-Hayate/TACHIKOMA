@@ -53,25 +53,33 @@ Discord サーバー経由で TACHIKOMA との自然言語対話・実機マニ�
      ③ ▶️ 家計簿を再開: systemctl start による安全復旧
      ④ 🔌 外部隔離: 3秒の待機猶予（通知送信完了バッファ）後に tailscale down を実行し、
         物理的なモニター・キーボード接続以外からのアクセスを遮断する最終防壁
-==============================================================================
-"""
 
-"""
-==============================================================================
-TACHIKOMA Discord Bridge エージェント (src/tachikoma_discord_bot.py)
-[段階的防衛・セキュリティ監視 ＆ 緊急キルスイッチ統合版]
+【追加・拡張された主要機能】
+1. 接続ハードウェア自動走査・列挙 (lsusb / lsblk / /dev/video* / アームポート)
+2. カメラ排他制御スナップショット (📸 撮影) ＆ 軽量MJPEGストリーミング配信 (📹 ライブ)
+3. Cockpit相当の7系統テレメトリ収集 ＆ GeminiモデルカスケードによるAIセキュリティ診断 (🧠 AI診断)
+4. スマホ画面に最適化した省スペース3段グリッドUI (SystemControlView)
+5. ターミナル即時デバッグ用の詳細トレースバック・タイムスタンプ付きログ出力
 ==============================================================================
 """
 
 import os
+import io
 import sys
 import time
 import json
+import glob
 import shutil
 import subprocess
+import threading
 import asyncio
 import argparse
+import traceback
+from datetime import datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
 import psutil
+import cv2
 from dotenv import load_dotenv
 import discord
 from discord.ext import commands, tasks
@@ -89,10 +97,42 @@ from core.sts3215 import STS3215Driver
 from core.motion_generator import ParametricMotionGenerator
 from core.kinematics import raw_to_radian, radian_to_raw, get_home_radians
 
+
+# ==============================================================================
+# デバッグログ出力ユーティリティ (ターミナルでバグ原因を即座に特定するためのヘルパー)
+# ==============================================================================
+def dlog(tag: str, msg: str, level: str = "INFO"):
+    """タイムスタンプ・タグ付きでターミナルへ即座にフラッシュ出力する"""
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+    prefix_map = {
+        "INFO": "ℹ️",
+        "OK": "✅",
+        "WARN": "⚠️",
+        "ERR": "❌",
+        "DEBUG": "🔍",
+    }
+    icon = prefix_map.get(level.upper(), "•")
+    print(f"[{now}] {icon} [{tag}] {msg}", flush=True)
+
+
+def derr(tag: str, context_msg: str, exc: Exception = None):
+    """例外発生時にエラー概要とフルスタックトレースをターミナルへ明示的に出力する"""
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+    print(f"\n{'='*78}", flush=True)
+    print(f"[{now}] ❌ [ERROR in {tag}] {context_msg}", flush=True)
+    if exc is not None:
+        print(f"Exception Type : {type(exc).__name__}", flush=True)
+        print(f"Exception Detail: {exc}", flush=True)
+    print("-" * 78, flush=True)
+    traceback.print_exc(file=sys.stdout)
+    print(f"{'='*78}\n", flush=True)
+
+
 # ==============================================================================
 # 環境変数・設定読み込み (Public公開対応: 固有値はすべて .env から注入)
 # ==============================================================================
 DISCORD_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
 
 TARGET_GUILD_ID = os.getenv("DISCORD_GUILD_ID")
 if TARGET_GUILD_ID:
@@ -102,10 +142,10 @@ ALERT_CHANNEL_ID = os.getenv("DISCORD_ALERT_CHANNEL_ID")
 if ALERT_CHANNEL_ID:
     ALERT_CHANNEL_ID = int(ALERT_CHANNEL_ID)
 
-# 監視・保護対象のsystemdサービス名 (デフォルトはプレースホルダー)
+# 監視・保護対象のsystemdサービス名
 PROTECTED_SERVICE = os.getenv("PROTECTED_SERVICE_NAME", "my_web_app")
 
-# プロセスホワイトリスト (.env のカンマ区切り文字列から動的生成、未設定時は最小限の標準構成)
+# プロセスホワイトリスト (.env のカンマ区切り文字列から動的生成)
 _env_safe_procs = os.getenv("SAFE_PROCESS_NAMES", "")
 if _env_safe_procs.strip():
     SAFE_PROCESS_NAMES = {p.strip() for p in _env_safe_procs.split(",") if p.strip()}
@@ -119,12 +159,24 @@ else:
 DISK_USAGE_THRESHOLD = float(os.getenv("DISK_USAGE_THRESHOLD", "90.0"))
 CPU_LOAD_THRESHOLD = float(os.getenv("CPU_LOAD_THRESHOLD", "3.8"))
 ALERT_COOLDOWN_SEC = int(os.getenv("ALERT_COOLDOWN_SEC", "900"))
-CAMERA_DEVICE_PATH = os.getenv("CAMERA_DEVICE_PATH", "/dev/video0")
+
+# カメラおよびMJPEGストリーム設定
+CAMERA_DEVICE_INDEX = int(os.getenv("CAMERA_DEVICE_INDEX", "0"))
+CAMERA_DEVICE_PATH = os.getenv("CAMERA_DEVICE_PATH", f"/dev/video{CAMERA_DEVICE_INDEX}")
+STREAM_PORT = int(os.getenv("STREAM_PORT", "8088"))
+STREAM_FPS = float(os.getenv("STREAM_FPS", "3.0"))
+STREAM_EXTERNAL_URL = os.getenv("STREAM_EXTERNAL_URL", "").strip()
+
+# Gemini 診断用モデルカスケードリスト (固定モデル名フォールバック)
+_default_models = "gemini-2.5-flash,gemini-2.5-flash-lite,gemini-1.5-flash"
+_env_models = os.getenv("GEMINI_MODEL_CASCADE", _default_models)
+GEMINI_MODEL_CASCADE = [m.strip() for m in _env_models.split(",") if m.strip()]
 
 # ロボット・システム状態管理
 is_busy = False
 abort_arm_flag = False
 last_alert_time = 0.0
+camera_lock = threading.Lock()  # カメラデバイスのスレッド間排他ロック
 
 planner = LLMTaskPlanner()
 generator = ParametricMotionGenerator()
@@ -135,19 +187,99 @@ intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 
+# ==============================================================================
+# 1. 接続ハードウェア走査・列挙 ＆ 物理コンテキスト生成
+# ==============================================================================
+def get_connected_hardware_list():
+    """接続中の機器（アーム・カメラ・外部ストレージ・USB）を箇条書きリストで取得"""
+    dlog("HW_SCAN", "接続ハードウェアの走査を開始...", "DEBUG")
+    hw_items = []
+
+    # (1) ロボットアーム接続確認
+    try:
+        if follower is not None and getattr(follower, "is_open", False):
+            hw_items.append(f"🦾 **アーム**: 接続中・通信可能 (`{FOLLOWER_PORT}`)")
+        elif os.path.exists(FOLLOWER_PORT):
+            hw_items.append(f"🦾 **アーム**: ポート認識済・未オープン (`{FOLLOWER_PORT}`)")
+        else:
+            hw_items.append(f"🦾 **アーム**: 未接続 (`{FOLLOWER_PORT}` 非存在)")
+    except Exception as e:
+        derr("HW_SCAN", "アーム接続状態の確認中にエラーが発生しました", e)
+        hw_items.append(f"🦾 **アーム**: 状態取得エラー (`{e}`)")
+
+    # (2) カメラデバイス確認 (/dev/video*)
+    try:
+        video_devs = sorted(glob.glob("/dev/video*"))
+        if video_devs:
+            hw_items.append(f"📷 **カメラ**: 認識済 (`{', '.join(video_devs)}`)")
+        else:
+            hw_items.append("📷 **カメラ**: 未接続 (`/dev/video*` なし)")
+    except Exception as e:
+        derr("HW_SCAN", "カメラデバイスの走査中にエラーが発生しました", e)
+        hw_items.append(f"📷 **カメラ**: 走査エラー (`{e}`)")
+
+    # (3) 外部ストレージ確認 (lsblk -J で内蔵ルート以外のディスク/パーティションを抽出)
+    try:
+        res = subprocess.run(
+            ["lsblk", "-J", "-o", "NAME,SIZE,TYPE,MOUNTPOINT,RM"],
+            capture_output=True, text=True, timeout=4
+        )
+        if res.returncode != 0:
+            dlog("HW_SCAN", f"lsblk 非ゼロ終了: {res.stderr.strip()}", "WARN")
+        data = json.loads(res.stdout)
+        ext_storages = []
+
+        def scan_blocks(blocks):
+            for b in blocks:
+                mnt = b.get("mountpoint")
+                rm = b.get("rm")
+                b_type = b.get("type")
+                name = b.get("name")
+                size = b.get("size")
+                # ルート領域やsnap以外でマウントされているドライブ、またはリムーバブルメディア
+                if mnt and mnt not in ("/", "/boot", "/boot/efi", "[SWAP]") and not str(mnt).startswith("/snap"):
+                    ext_storages.append(f"`/dev/{name}` ({size} -> `{mnt}`)")
+                elif rm in (True, "1", 1) and b_type in ("part", "disk") and not mnt:
+                    ext_storages.append(f"`/dev/{name}` ({size}, 未マウント)")
+                if "children" in b:
+                    scan_blocks(b["children"])
+
+        scan_blocks(data.get("blockdevices", []))
+        if ext_storages:
+            hw_items.append(f"💾 **外部ストレージ**: {', '.join(ext_storages)}")
+        else:
+            hw_items.append("💾 **外部ストレージ**: なし (内蔵SSDのみ)")
+    except Exception as e:
+        derr("HW_SCAN", "lsblk による外部ストレージ走査中にエラーが発生しました", e)
+        hw_items.append("💾 **外部ストレージ**: 取得失敗")
+
+    # (4) 主要USBデバイス (Linux Foundation Root Hub 等を除外)
+    try:
+        usb_res = subprocess.run(["lsusb"], capture_output=True, text=True, timeout=4)
+        usb_names = []
+        for line in usb_res.stdout.splitlines():
+            if "Linux Foundation" in line or "root hub" in line.lower():
+                continue
+            parts = line.split("ID ")
+            if len(parts) > 1:
+                desc = parts[1].split(" ", 1)
+                if len(desc) > 1:
+                    usb_names.append(desc[1].strip())
+        if usb_names:
+            hw_items.append(f"🔌 **USB機器**: {', '.join(usb_names[:5])}")
+        else:
+            hw_items.append("🔌 **USB機器**: 外部USB機器なし")
+    except Exception as e:
+        derr("HW_SCAN", "lsusb によるUSB機器走査中にエラーが発生しました", e)
+        hw_items.append("🔌 **USB機器**: 取得失敗")
+
+    return hw_items
+
+
 def get_hardware_and_world_context():
     """現在の実機接続状態、カメラ状態、机上物体情報を取得してプロンプト用テキストを生成"""
-    global follower
-
-    arm_status = (
-        "接続中 (動作可能)"
-        if (follower is not None and getattr(follower, "is_open", False))
-        else "未接続 (実機動作不可・シミュレーションのみ)"
-    )
-
-    camera_status = "未接続 / 不明"
-    if os.path.exists(CAMERA_DEVICE_PATH):
-        camera_status = f"接続中 ({CAMERA_DEVICE_PATH} 検出済み)"
+    hw_list = get_connected_hardware_list()
+    hw_summary = "\n".join(f"- {item}" for item in hw_list)
 
     world_state_path = os.path.join(BASE_DIR, "config", "current_world_state.json")
     objects_summary = "現在、机の上に検知された物体データはありません（空の状態または未計測）。"
@@ -166,13 +298,12 @@ def get_hardware_and_world_context():
                         for o in objs
                     ]
                     objects_summary = "【机の上にある検知済み物体リスト】:\n" + "\n".join(lines)
-        except Exception:
-            pass
+        except Exception as e:
+            derr("WORLD_CTX", f"{world_state_path} の読み込み中にエラーが発生しました", e)
 
     context_prompt = f"""
 [現在のタチコマ物理環境ステータス]
-- 実機ロボットアーム: {arm_status}
-- カメラデバイス: {camera_status}
+{hw_summary}
 - 机上認識状況:
 {objects_summary}
 ※ユーザーから机の上の状況や接続状態を尋ねられた場合は、上記の実測情報を基に正確に回答してください。存在しない物体をでっち上げないでください。
@@ -180,39 +311,325 @@ def get_hardware_and_world_context():
     return context_prompt
 
 
+# ==============================================================================
+# 2. カメラ機能 (静止画スナップショット ＆ 軽量 MJPEG ストリーミングサーバー)
+# ==============================================================================
+def capture_jpeg_frame_sync():
+    """カメラを1フレームだけ開いてJPEGバイト列を取得し、即座に解放する"""
+    if not os.path.exists(CAMERA_DEVICE_PATH):
+        msg = f"カメラデバイス ({CAMERA_DEVICE_PATH}) が存在しません。物理接続を確認してください。"
+        dlog("CAMERA", msg, "WARN")
+        return None, msg
+
+    with camera_lock:
+        cap = None
+        try:
+            # V4L2 バックエンドを明示してオープン
+            cap = cv2.VideoCapture(CAMERA_DEVICE_INDEX, cv2.CAP_V4L2)
+            if not cap.isOpened():
+                cap = cv2.VideoCapture(CAMERA_DEVICE_INDEX)
+
+            if not cap.isOpened():
+                msg = f"カメラ (index={CAMERA_DEVICE_INDEX}, path={CAMERA_DEVICE_PATH}) をオープンできませんでした。他プロセスが使用中か権限(videoグループ)を確認してください。"
+                dlog("CAMERA", msg, "ERR")
+                return None, msg
+
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+
+            # オートフォーカス・露出安定のため数フレーム空読み
+            for _ in range(3):
+                cap.read()
+
+            ret, frame = cap.read()
+            if not ret or frame is None:
+                msg = "カメラオープンには成功しましたが、フレームの読み取り(cap.read)に失敗しました。"
+                dlog("CAMERA", msg, "ERR")
+                return None, msg
+
+            ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+            if not ok:
+                msg = "取得したフレームのJPEGエンコード(cv2.imencode)に失敗しました。"
+                dlog("CAMERA", msg, "ERR")
+                return None, msg
+
+            return buf.tobytes(), None
+        except Exception as e:
+            derr("CAMERA", "カメラ撮影処理中に予期しない例外が発生しました", e)
+            return None, f"カメラ例外: {e}"
+        finally:
+            if cap is not None:
+                cap.release()
+
+
+class MJPEGStreamHandler(BaseHTTPRequestHandler):
+    """スマホブラウザ向け軽量MJPEGストリーム配信ハンドラ (1〜5fps)"""
+    def log_message(self, format, *args):
+        # アクセスごとに1行だけ簡潔にターミナルへ表示
+        dlog("MJPEG_HTTP", f"{self.address_string()} - {format % args}", "DEBUG")
+
+    def do_GET(self):
+        if self.path in ("/", "/index.html"):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            html = (
+                "<html><head><meta name='viewport' content='width=device-width, initial-scale=1.0'>"
+                "<title>TACHIKOMA Live Camera</title>"
+                "<style>body{background:#111;color:#eee;text-align:center;font-family:sans-serif;margin:0;padding:16px;}"
+                "img{max-width:100%;height:auto;border:2px solid #38bdf8;border-radius:8px;}</style></head>"
+                "<body><h3>📹 TACHIKOMA Live View</h3><img src='/stream.mjpg' /></body></html>"
+            )
+            self.wfile.write(html.encode("utf-8"))
+
+        elif self.path.startswith("/stream.mjpg"):
+            dlog("MJPEG_STREAM", f"クライアント ({self.client_address[0]}) へのライブ配信を開始しました", "INFO")
+            self.send_response(200)
+            self.send_header("Age", "0")
+            self.send_header("Cache-Control", "no-cache, private")
+            self.send_header("Pragma", "no-cache")
+            self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+            self.end_headers()
+
+            interval = 1.0 / max(0.5, STREAM_FPS)
+            try:
+                while True:
+                    start_t = time.time()
+                    jpg_bytes, err = capture_jpeg_frame_sync()
+                    if jpg_bytes:
+                        self.wfile.write(b"--frame\r\n")
+                        self.send_header("Content-Type", "image/jpeg")
+                        self.send_header("Content-Length", str(len(jpg_bytes)))
+                        self.end_headers()
+                        self.wfile.write(jpg_bytes)
+                        self.wfile.write(b"\r\n")
+                    else:
+                        dlog("MJPEG_STREAM", f"フレーム取得スキップ: {err}", "WARN")
+                        time.sleep(1.0)
+                    elapsed = time.time() - start_t
+                    time.sleep(max(0.05, interval - elapsed))
+            except (BrokenPipeError, ConnectionResetError):
+                dlog("MJPEG_STREAM", f"クライアント ({self.client_address[0]}) がストリーム視聴を終了しました", "INFO")
+            except Exception as e:
+                derr("MJPEG_STREAM", "MJPEG配信ループ中にエラーが発生しました", e)
+        else:
+            self.send_error(404)
+
+
+def start_mjpeg_server_daemon():
+    """バックグラウンドスレッドでMJPEGサーバーを起動"""
+    try:
+        server = ThreadingHTTPServer(("127.0.0.1", STREAM_PORT), MJPEGStreamHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        dlog("MJPEG_SERVER", f"カメラ配信サーバー起動完了: http://127.0.0.1:{STREAM_PORT} (FPS={STREAM_FPS})", "OK")
+        if STREAM_EXTERNAL_URL:
+            dlog("MJPEG_SERVER", f"外部アクセスURL (Tailscale Serve): {STREAM_EXTERNAL_URL}", "INFO")
+        else:
+            dlog("MJPEG_SERVER", ".env に STREAM_EXTERNAL_URL が未設定のため、Discordパネルの [📹 ライブ] ボタンは非表示になります", "WARN")
+    except Exception as e:
+        derr("MJPEG_SERVER", f"ポート {STREAM_PORT} でのMJPEGサーバー起動に失敗しました（二重起動やポート競合を確認してください）", e)
+
+
+# ==============================================================================
+# 3. 7系統メトリクス収集 ＆ Gemini セキュリティ診断 (モデルカスケード)
+# ==============================================================================
+def _run_cmd_safe(cmd_list, timeout=5, label="CMD"):
+    try:
+        res = subprocess.run(cmd_list, capture_output=True, text=True, timeout=timeout)
+        out = res.stdout.strip()
+        if res.returncode != 0 and not out:
+            err_txt = res.stderr.strip()
+            dlog("METRICS", f"[{label}] コマンド ({' '.join(cmd_list)}) 非ゼロ終了(code={res.returncode}): {err_txt}", "WARN")
+            return f"(コマンド終了コード {res.returncode}: {err_txt or '出力なし'})"
+        return out or "(該当データなし)"
+    except Exception as e:
+        derr("METRICS", f"[{label}] コマンド ({' '.join(cmd_list)}) 実行例外", e)
+        return f"(取得エラー: {e})"
+
+
+def collect_7_security_metrics_sync():
+    """Cockpit相当の7系統システム・セキュリティデータを一括収集"""
+    dlog("AI_DIAG", "7系統のシステム・セキュリティメトリクス収集を開始...", "INFO")
+
+    # ① 外部接続状況 (ESTABLISHED)
+    ext_conns = []
+    try:
+        for c in psutil.net_connections(kind="tcp"):
+            if c.status == "ESTABLISHED" and c.raddr:
+                ext_conns.append(f"PID:{c.pid} {c.laddr.ip}:{c.laddr.port} -> {c.raddr.ip}:{c.raddr.port}")
+    except Exception as e:
+        dlog("AI_DIAG", f"psutil.net_connections 失敗 ({e})、ss コマンドへフォールバックします", "WARN")
+        ext_conns.append(_run_cmd_safe(["ss", "-tunp", "state", "established"], label="ss_established"))
+    sec1 = "\n".join(ext_conns[:20]) if ext_conns else "外部ESTABLISHED接続なし"
+
+    # ② 認証・ログイン試行ログ (直近1時間)
+    sec2 = _run_cmd_safe(
+        ["journalctl", "-u", "ssh", "-u", "cockpit", "--since", "1 hour ago", "-p", "warning", "--no-pager", "-n", "20"],
+        label="auth_log"
+    )
+
+    # ③ CPU/メモリ消費上位プロセス
+    ps_raw = _run_cmd_safe(["ps", "-eo", "pid,user,%cpu,%mem,comm", "--sort=-%cpu"], label="top_ps")
+    sec3 = "\n".join(ps_raw.splitlines()[:11])
+
+    # ④ 停止・失敗サービス
+    sec4 = _run_cmd_safe(["systemctl", "--failed", "--no-pager"], label="systemd_failed")
+
+    # ⑤ 直近の特権実行履歴 (sudo)
+    sec5 = _run_cmd_safe(["journalctl", "_COMM=sudo", "--since", "1 hour ago", "--no-pager", "-n", "15"], label="sudo_log")
+
+    # ⑥ システム重大エラーログ (err..emerg)
+    sec6 = _run_cmd_safe(["journalctl", "-p", "err..emerg", "--since", "1 hour ago", "--no-pager", "-n", "15"], label="err_log")
+
+    # ⑦ ハードウェア温度・ストレージ状態
+    temps = []
+    try:
+        s_temps = psutil.sensors_temperatures()
+        for name, entries in s_temps.items():
+            for e in entries:
+                temps.append(f"{name}({e.label or 'core'}): {e.current}°C")
+    except Exception as e:
+        dlog("AI_DIAG", f"温度センサー取得スキップ: {e}", "WARN")
+
+    usage = shutil.disk_usage("/")
+    disk_info = f"Root Disk: {(usage.used / usage.total) * 100:.1f}% used ({usage.free // (1024**3)}GB free)"
+    sec7 = (", ".join(temps) if temps else "温度センサー値なし") + f"\n{disk_info}"
+
+    report = f"""
+[1. 外部TCP接続(ESTABLISHED)]
+{sec1}
+
+[2. 認証・ログイン警告ログ(直近1時間)]
+{sec2}
+
+[3. リソース消費上位プロセス(Top 10)]
+{sec3}
+
+[4. 失敗サービス(systemctl --failed)]
+{sec4}
+
+[5. 直近のsudo特権実行履歴(直近1時間)]
+{sec5}
+
+[6. OS・カーネルエラーログ(直近1時間)]
+{sec6}
+
+[7. ハードウェア温度・ストレージ健全性]
+{sec7}
+""".strip()
+
+    dlog("AI_DIAG", f"メトリクス収集完了 (総文字数: {len(report)} chars)", "OK")
+    return report
+
+
+def run_ai_security_diagnosis_sync():
+    """7系統データを収集してGeminiカスケードへ投入し、(診断結果テキスト, 使用モデル名) を返す"""
+    if not GEMINI_API_KEY:
+        msg = "`.env` に `GEMINI_API_KEY` (または `GOOGLE_API_KEY`) が設定されていません。"
+        dlog("AI_DIAG", msg, "ERR")
+        return f"❌ {msg}", "N/A"
+
+    raw_metrics = collect_7_security_metrics_sync()
+    prompt = f"""
+あなたはLinuxサーバー（Ubuntu 24.04 / Tailscale環境）の専属セキュリティ・インフラ診断AIです。
+以下の7系統の実測テレメトリデータを分析し、スマホ画面で読みやすいよう簡潔な日本語の箇条書きで診断結果を出力してください。
+
+【出力フォーマット】
+1. **総合判定**: （🟢安全 / 🟡要注意 / 🔴危険 のいずれかと一言理由）
+2. **通信・認証の安全性**: （不審な外部IP接続や不正ログイン試行の有無）
+3. **プロセス・サービスの健全性**: （暴走プロセスやfailedサービスの有無）
+4. **ハードウェア・OS状態**: （温度・ディスク・エラーログの評価と推奨アクション）
+
+【実測テレメトリデータ】
+{raw_metrics}
+"""
+
+    errors = []
+    for model_name in GEMINI_MODEL_CASCADE:
+        dlog("AI_DIAG", f"Gemini API 呼び出し試行中... (Model: {model_name})", "INFO")
+
+        # 1. 新SDK (google-genai) での試行
+        try:
+            from google import genai
+            client = genai.Client(api_key=GEMINI_API_KEY)
+            resp = client.models.generate_content(model=model_name, contents=prompt)
+            if resp and resp.text:
+                dlog("AI_DIAG", f"Gemini 診断成功 (SDK: google-genai, Model: {model_name})", "OK")
+                return resp.text.strip(), model_name
+        except ImportError:
+            dlog("AI_DIAG", "google-genai パッケージが見つからないため旧SDKを試行します", "DEBUG")
+        except Exception as e:
+            derr("AI_DIAG", f"google-genai でのモデル '{model_name}' 呼び出し失敗", e)
+            errors.append(f"[{model_name} (new SDK)] {type(e).__name__}: {e}")
+            continue
+
+        # 2. 旧SDK (google-generativeai) へのフォールバック試行
+        try:
+            import google.generativeai as old_genai
+            old_genai.configure(api_key=GEMINI_API_KEY)
+            m = old_genai.GenerativeModel(model_name)
+            resp = m.generate_content(prompt)
+            if resp and resp.text:
+                dlog("AI_DIAG", f"Gemini 診断成功 (SDK: google-generativeai, Model: {model_name})", "OK")
+                return resp.text.strip(), model_name
+        except Exception as e:
+            derr("AI_DIAG", f"google-generativeai でのモデル '{model_name}' 呼び出し失敗", e)
+            errors.append(f"[{model_name} (old SDK)] {type(e).__name__}: {e}")
+            continue
+
+    err_summary = "\n".join(errors[-3:])
+    return (
+        f"❌ すべてのモデル候補 (`{', '.join(GEMINI_MODEL_CASCADE)}`) でAPI呼び出しが失敗しました。\n"
+        f"ターミナルのエラートレースを確認してください。\n```\n{err_summary[:800]}\n```",
+        "Failed"
+    )
+
+
+# ==============================================================================
+# 4. 実機アーム制御シーケンス
+# ==============================================================================
 def execute_tasks_sync(tasks_list):
     """実機サーボへの物理搬送シーケンス（緊急停止割り込み対応・ブロッキング同期関数）"""
     global follower, abort_arm_flag
     abort_arm_flag = False
 
     if follower is None or not getattr(follower, "is_open", False):
+        dlog("ARM_EXEC", "実機アーム未接続のためプレビューモードとしてスキップしました", "WARN")
         return "⚠️ 実機アームが接続されていません（プレビューのみモード）"
 
     try:
+        dlog("ARM_EXEC", f"搬送タスク開始 (全 {len(tasks_list)} ステップ)", "INFO")
         for sid in SERVO_IDS:
             follower.set_torque(sid, True)
 
         home_rad = get_home_radians()
         for idx, task in enumerate(tasks_list, 1):
             if abort_arm_flag:
+                dlog("ARM_EXEC", f"ステップ {idx} 開始前に緊急停止フラグを検知しました", "WARN")
                 return "🛑 緊急停止ボタンにより搬送タスクを中断し、脱力しました。"
 
             p = task.get("pick")
             d = task.get("place")
+            dlog("ARM_EXEC", f"Step {idx}: 軌道生成中 (pick={p}, place={d})", "DEBUG")
             success, frames, log_text = generator.generate_from_coords(p, d)
             if not success:
+                dlog("ARM_EXEC", f"Step {idx} 軌道生成失敗: {log_text}", "WARN")
                 continue
 
             for _, rad_positions in frames:
                 if abort_arm_flag:
+                    dlog("ARM_EXEC", "サーボ制御ループ中に緊急停止フラグを検知しました", "WARN")
                     return "🛑 緊急停止ボタンにより動作を即時中断し、脱力しました。"
                 for sid in SERVO_IDS:
                     raw_val = radian_to_raw(sid, rad_positions[sid])
                     follower.write_position(sid, raw_val)
                 time.sleep(0.02)
 
+        dlog("ARM_EXEC", "全搬送タスクが正常に完了しました", "OK")
         return "✅ すべての搬送タスクが完了しました。"
     except Exception as e:
+        derr("ARM_EXEC", "実機サーボ搬送シーケンス中に例外が発生しました", e)
         return f"❌ 実行中エラー: {e}"
     finally:
         for sid in SERVO_IDS:
@@ -223,15 +640,68 @@ def execute_tasks_sync(tasks_list):
 
 
 # ==============================================================================
-# 緊急制御パネル UI (スマホからのワンタップ停止・再開)
+# 5. コンパクト緊急制御パネル UI (SystemControlView)
 # ==============================================================================
 class SystemControlView(View):
+    """
+    省スペース3段グリッド配置:
+    Row 0 (観測・診断): [ 📸 撮影 ] [ 📹 ライブ ] [ 🧠 AI診断 ]
+    Row 1 (停止・再開): [ 🛑 アーム ] [ 🛑 Web ] [ ▶️ Web ]
+    Row 2 (最終防壁)  : [ 🔌 外部隔離 ]
+    """
     def __init__(self):
         super().__init__(timeout=None)
+        if STREAM_EXTERNAL_URL:
+            self.add_item(
+                Button(
+                    label="📹 ライブ",
+                    style=discord.ButtonStyle.link,
+                    url=STREAM_EXTERNAL_URL,
+                    row=0,
+                )
+            )
 
-    @discord.ui.button(label="🛑 アーム緊急停止 (脱力)", style=discord.ButtonStyle.danger, custom_id="sys_stop_arm", row=0)
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item):
+        """UIボタン処理中のあらゆる未捕捉例外をターミナルへ詳細表示し、Discord側にも通知する"""
+        derr("UI_VIEW", f"ボタン ({getattr(item, 'label', item)}) の処理中に例外が発生しました", error)
+        err_msg = f"❌ **ボタン処理エラー (`{type(error).__name__}`)**: `{error}`\n※詳細はサーバーターミナルを確認してください。"
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(err_msg, ephemeral=True)
+            else:
+                await interaction.response.send_message(err_msg, ephemeral=True)
+        except Exception:
+            pass
+
+    @discord.ui.button(label="📸 撮影", style=discord.ButtonStyle.secondary, custom_id="sys_cam_snap", row=0)
+    async def snap_camera(self, interaction: discord.Interaction, button: Button):
+        dlog("UI_BTN", f"[📸 撮影] が押されました (User: {interaction.user})", "INFO")
+        await interaction.response.defer()
+        jpg_bytes, err = await asyncio.to_thread(capture_jpeg_frame_sync)
+        if err or not jpg_bytes:
+            await interaction.followup.send(f"⚠️ **撮影失敗**: {err}")
+            return
+        file = discord.File(io.BytesIO(jpg_bytes), filename="snapshot.jpg")
+        dlog("UI_BTN", "スナップショット撮影・Discord送信完了", "OK")
+        await interaction.followup.send("📸 **現在のカメラ視界**", file=file)
+
+    @discord.ui.button(label="🧠 AI診断", style=discord.ButtonStyle.primary, custom_id="sys_ai_diag", row=0)
+    async def ai_diagnosis(self, interaction: discord.Interaction, button: Button):
+        dlog("UI_BTN", f"[🧠 AI診断] が押されました (User: {interaction.user})", "INFO")
+        await interaction.response.defer()
+        diag_text, used_model = await asyncio.to_thread(run_ai_security_diagnosis_sync)
+        embed = discord.Embed(
+            title="🧠 Gemini システム・セキュリティ診断レポート",
+            description=diag_text[:4000],
+            color=0x8B5CF6 if used_model != "Failed" else 0xEF4444,
+        )
+        embed.set_footer(text=f"使用モデル: {used_model} | 対象: ①外部接続 ②認証 ③上位PS ④失敗SVC ⑤sudo ⑥エラー ⑦温度/SSD")
+        await interaction.followup.send(embed=embed)
+
+    @discord.ui.button(label="🛑 アーム", style=discord.ButtonStyle.danger, custom_id="sys_stop_arm", row=1)
     async def stop_arm(self, interaction: discord.Interaction, button: Button):
         global is_busy, abort_arm_flag, follower
+        dlog("UI_BTN", f"[🛑 アーム] 緊急停止が押されました (User: {interaction.user})", "WARN")
         await interaction.response.defer()
         abort_arm_flag = True
         is_busy = False
@@ -240,31 +710,51 @@ class SystemControlView(View):
             for sid in SERVO_IDS:
                 try:
                     follower.set_torque(sid, False)
-                except Exception:
-                    pass
+                except Exception as e:
+                    derr("UI_BTN", f"サーボ ID:{sid} のトルク解除中にエラー", e)
 
         await interaction.followup.send("🛑 **ロボットアームに緊急停止・脱力指令を送信しました。**")
 
-    @discord.ui.button(label="🛑 Webアプリを停止", style=discord.ButtonStyle.danger, custom_id="sys_stop_service", row=0)
+    @discord.ui.button(label="🛑 Web", style=discord.ButtonStyle.danger, custom_id="sys_stop_service", row=1)
     async def stop_service(self, interaction: discord.Interaction, button: Button):
+        dlog("UI_BTN", f"[🛑 Web] サービス停止が押されました (Target: {PROTECTED_SERVICE})", "WARN")
         await interaction.response.defer()
-        await asyncio.to_thread(subprocess.run, ["sudo", "systemctl", "stop", PROTECTED_SERVICE])
+        res = await asyncio.to_thread(
+            subprocess.run,
+            ["sudo", "systemctl", "stop", PROTECTED_SERVICE],
+            capture_output=True, text=True
+        )
+        if res.returncode != 0:
+            dlog("UI_BTN", f"systemctl stop 失敗: {res.stderr.strip()}", "ERR")
+            await interaction.followup.send(f"⚠️ `{PROTECTED_SERVICE}.service` 停止コマンドエラー:\n```\n{res.stderr.strip()}\n```")
+            return
+        dlog("UI_BTN", f"{PROTECTED_SERVICE}.service を停止しました", "OK")
         await interaction.followup.send(f"🛑 `{PROTECTED_SERVICE}.service` を緊急停止しました。")
 
-    @discord.ui.button(label="▶️ Webアプリを再開", style=discord.ButtonStyle.success, custom_id="sys_start_service", row=1)
+    @discord.ui.button(label="▶️ Web", style=discord.ButtonStyle.success, custom_id="sys_start_service", row=1)
     async def start_service(self, interaction: discord.Interaction, button: Button):
+        dlog("UI_BTN", f"[▶️ Web] サービス再開が押されました (Target: {PROTECTED_SERVICE})", "INFO")
         await interaction.response.defer()
-        await asyncio.to_thread(subprocess.run, ["sudo", "systemctl", "start", PROTECTED_SERVICE])
+        start_res = await asyncio.to_thread(
+            subprocess.run,
+            ["sudo", "systemctl", "start", PROTECTED_SERVICE],
+            capture_output=True, text=True
+        )
+        if start_res.returncode != 0:
+            dlog("UI_BTN", f"systemctl start 失敗: {start_res.stderr.strip()}", "ERR")
         res = await asyncio.to_thread(
             subprocess.run,
             ["sudo", "systemctl", "is-active", PROTECTED_SERVICE],
             capture_output=True,
             text=True,
         )
-        await interaction.followup.send(f"▶️ `{PROTECTED_SERVICE}.service` を再開しました（状態: `{res.stdout.strip()}`）。")
+        state_str = res.stdout.strip()
+        dlog("UI_BTN", f"{PROTECTED_SERVICE}.service 再開処理完了 (状態: {state_str})", "OK")
+        await interaction.followup.send(f"▶️ `{PROTECTED_SERVICE}.service` を再開しました（状態: `{state_str}`）。")
 
-    @discord.ui.button(label="🔌 外部隔離 (VPN切断)", style=discord.ButtonStyle.secondary, custom_id="sys_isolate_net", row=1)
+    @discord.ui.button(label="🔌 外部隔離", style=discord.ButtonStyle.secondary, custom_id="sys_isolate_net", row=2)
     async def isolate_net(self, interaction: discord.Interaction, button: Button):
+        dlog("UI_BTN", f"[🔌 外部隔離] が押されました！3秒後に tailscale down を実行します (User: {interaction.user})", "WARN")
         await interaction.response.defer()
         await interaction.followup.send(
             "🚨 **3秒後に Tailscale VPN を切断し、サーバーを外部ネットワークから完全隔離します。**\n"
@@ -275,52 +765,56 @@ class SystemControlView(View):
 
 
 # ==============================================================================
-# 段階的防衛 (Tiered Defense) バックグラウンド監視ロジック
+# 6. 段階的防衛 (Tiered Defense) バックグラウンド監視ロジック
 # ==============================================================================
 def check_system_security_sync():
     """同期スレッドでシステム状態を検査し、(警告リスト, 自動防衛アクションリスト) を返す"""
     warnings = []
     auto_actions = []
 
-    # --- [レベル1: 警告監視] ---
-    usage = shutil.disk_usage("/")
-    disk_pct = (usage.used / usage.total) * 100
-    if disk_pct > DISK_USAGE_THRESHOLD:
-        warnings.append(f"💾 **ディスク残量警告**: 使用率 `{disk_pct:.1f}%`")
+    try:
+        # --- [レベル1: 警告監視] ---
+        usage = shutil.disk_usage("/")
+        disk_pct = (usage.used / usage.total) * 100
+        if disk_pct > DISK_USAGE_THRESHOLD:
+            warnings.append(f"💾 **ディスク残量警告**: 使用率 `{disk_pct:.1f}%` (閾値: `{DISK_USAGE_THRESHOLD}%`)")
 
-    load1, _, _ = os.getloadavg()
-    if load1 > CPU_LOAD_THRESHOLD:
-        warnings.append(f"🔥 **CPU高負荷**: 1分平均ロード `{load1:.2f}`")
+        load1, _, _ = os.getloadavg()
+        if load1 > CPU_LOAD_THRESHOLD:
+            warnings.append(f"🔥 **CPU高負荷**: 1分平均ロード `{load1:.2f}` (閾値: `{CPU_LOAD_THRESHOLD}`)")
 
-    ssh_check = subprocess.run(
-        ["journalctl", "-u", "ssh", "--since", "2 minutes ago"],
-        capture_output=True,
-        text=True,
-    )
-    failed_ssh = sum(1 for line in ssh_check.stdout.splitlines() if "Failed password" in line)
-    if failed_ssh > 0:
-        warnings.append(f"🚨 **SSH不正ログイン試行**: 直近2分間で `{failed_ssh}` 件の失敗を検知")
+        ssh_check = subprocess.run(
+            ["journalctl", "-u", "ssh", "--since", "2 minutes ago", "--no-pager"],
+            capture_output=True,
+            text=True,
+        )
+        failed_ssh = sum(1 for line in ssh_check.stdout.splitlines() if "Failed password" in line)
+        if failed_ssh > 0:
+            warnings.append(f"🚨 **SSH不正ログイン試行**: 直近2分間で `{failed_ssh}` 件の失敗を検知")
 
-    # --- [レベル2: 身元不明コードの検知 ＆ 自動停止 (フェイルセーフ)] ---
-    suspicious_dirs = ("/tmp/", "/var/tmp/", "/dev/shm/")
-    for proc in psutil.process_iter(["pid", "name", "exe"]):
-        try:
-            p_info = proc.info
-            exe_path = p_info.get("exe") or ""
-            p_name = p_info.get("name") or ""
+        # --- [レベル2: 身元不明コードの検知 ＆ 自動停止 (フェイルセーフ)] ---
+        suspicious_dirs = ("/tmp/", "/var/tmp/", "/dev/shm/")
+        for proc in psutil.process_iter(["pid", "name", "exe"]):
+            try:
+                p_info = proc.info
+                exe_path = p_info.get("exe") or ""
+                p_name = p_info.get("name") or ""
 
-            if any(exe_path.startswith(d) for d in suspicious_dirs) and p_name not in SAFE_PROCESS_NAMES:
-                pid = p_info["pid"]
-                proc.kill()
-                subprocess.run(["sudo", "systemctl", "stop", PROTECTED_SERVICE])
-                auto_actions.append(
-                    f"🛡️ **不審プロセスを自動強制終了しました**\n"
-                    f"・対象: `{p_name}` (PID: `{pid}`)\n"
-                    f"・実行パス: `{exe_path}`\n"
-                    f"・保護措置: `{PROTECTED_SERVICE}.service` を自動停止しました。"
-                )
-        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
-            continue
+                if any(exe_path.startswith(d) for d in suspicious_dirs) and p_name not in SAFE_PROCESS_NAMES:
+                    pid = p_info["pid"]
+                    dlog("SEC_DEFENSE", f"不審プロセス検知! PID={pid}, Name={p_name}, Path={exe_path} -> 即時Kill実行", "ERR")
+                    proc.kill()
+                    subprocess.run(["sudo", "systemctl", "stop", PROTECTED_SERVICE])
+                    auto_actions.append(
+                        f"🛡️ **不審プロセスを自動強制終了しました**\n"
+                        f"・対象: `{p_name}` (PID: `{pid}`)\n"
+                        f"・実行パス: `{exe_path}`\n"
+                        f"・保護措置: `{PROTECTED_SERVICE}.service` を自動停止しました。"
+                    )
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                continue
+    except Exception as e:
+        derr("SEC_MONITOR", "定期セキュリティ監視スキャン中にエラーが発生しました", e)
 
     return warnings, auto_actions
 
@@ -333,11 +827,13 @@ async def security_monitor_task():
 
     channel = bot.get_channel(ALERT_CHANNEL_ID)
     if channel is None:
+        dlog("SEC_MONITOR", f"ALERT_CHANNEL_ID ({ALERT_CHANNEL_ID}) のチャンネルが見つかりません", "WARN")
         return
 
     warnings, auto_actions = await asyncio.to_thread(check_system_security_sync)
 
     if auto_actions:
+        dlog("SEC_MONITOR", "レベル2自動防衛アクションを発動・Discordへ緊急通知します", "ERR")
         embed = discord.Embed(
             title="🚨 【自動防衛発動】不審な挙動を検知・自動停止しました",
             description="\n\n".join(auto_actions),
@@ -349,18 +845,19 @@ async def security_monitor_task():
         return
 
     if warnings and (time.time() - last_alert_time > ALERT_COOLDOWN_SEC):
+        dlog("SEC_MONITOR", f"レベル1警告を検知・Discordへ通知します: {warnings}", "WARN")
         embed = discord.Embed(
             title="⚠️ システム・セキュリティ警告",
             description="\n".join(warnings),
             color=0xF59E0B,
         )
-        embed.set_footer(text="異常がある場合は下のボタンから手動で緊急停止できます。")
+        embed.set_footer(text="異常がある場合は下のボタンから手動で緊急停止・AI診断を実行できます。")
         await channel.send(embed=embed, view=SystemControlView())
         last_alert_time = time.time()
 
 
 # ==============================================================================
-# ロボットタスク確認ボタン UI
+# 7. ロボットタスク確認ボタン UI ＆ ステータスパネル生成
 # ==============================================================================
 class TaskConfirmView(View):
     def __init__(self, tasks_list, user_id):
@@ -408,6 +905,44 @@ class TaskConfirmView(View):
         await interaction.edit_original_response(content="🛑 **タスクをキャンセルしました。**", view=self)
 
 
+def build_status_embed_sync():
+    """!control / !status 用のシステム状態＆接続機器Embedを同期生成"""
+    usage = shutil.disk_usage("/")
+    disk_pct = (usage.used / usage.total) * 100
+    load1, _, _ = os.getloadavg()
+    mem = psutil.virtual_memory()
+
+    svc_res = subprocess.run(
+        ["sudo", "systemctl", "is-active", PROTECTED_SERVICE],
+        capture_output=True,
+        text=True,
+    )
+    hw_items = get_connected_hardware_list()
+    hw_block = "\n".join(f"• {item}" for item in hw_items)
+
+    desc = (
+        f"**【システムメトリクス】**\n"
+        f"• **CPU 1分負荷**: `{load1:.2f}`\n"
+        f"• **メモリ使用率**: `{mem.percent:.1f}%` (`{mem.used // (1024**2)}MB` / `{mem.total // (1024**2)}MB`)\n"
+        f"• **ディスク使用率**: `{disk_pct:.1f}%`\n"
+        f"• **保護対象サービス (`{PROTECTED_SERVICE}`)**: `{svc_res.stdout.strip()}`\n"
+        f"• **アーム状態**: `{'動作中' if is_busy else '待機中'}`\n\n"
+        f"**【接続ハードウェア一覧】**\n"
+        f"{hw_block}"
+    )
+
+    embed = discord.Embed(
+        title="🛠️ システム状態監視 ＆ 緊急制御パネル",
+        description=desc,
+        color=0x38BDF8,
+    )
+    embed.set_footer(text=f"AI診断モデル優先順: {' -> '.join(GEMINI_MODEL_CASCADE)}")
+    return embed
+
+
+# ==============================================================================
+# 8. Discord Bot イベントハンドラ ＆ エントリーポイント
+# ==============================================================================
 @bot.event
 async def on_ready():
     bot.add_view(SystemControlView())
@@ -416,8 +951,9 @@ async def on_ready():
         security_monitor_task.start()
 
     guild_info = f" (対象Guild: {TARGET_GUILD_ID})" if TARGET_GUILD_ID else " (全サーバー対象)"
-    print(f"🤖 TACHIKOMA Discord Bot 起動完了: {bot.user.name} ({bot.user.id}){guild_info}")
-    print(f"🛡️ 段階的防衛モニタリング稼働中 (通知先Ch: {ALERT_CHANNEL_ID})")
+    dlog("BOT_READY", f"TACHIKOMA Discord Bot 起動完了: {bot.user.name} (ID: {bot.user.id}){guild_info}", "OK")
+    dlog("BOT_READY", f"段階的防衛モニタリング稼働中 (通知先Ch: {ALERT_CHANNEL_ID}, 保護SVC: {PROTECTED_SERVICE})", "INFO")
+    dlog("BOT_READY", f"AI診断カスケードモデル: {GEMINI_MODEL_CASCADE}", "INFO")
 
 
 @bot.event
@@ -434,99 +970,106 @@ async def on_message(message: discord.Message):
     if not user_text:
         return
 
-    if user_text in ("!control", "!status"):
-        usage = shutil.disk_usage("/")
-        disk_pct = (usage.used / usage.total) * 100
-        load1, _, _ = os.getloadavg()
-        svc_res = await asyncio.to_thread(
-            subprocess.run,
-            ["sudo", "systemctl", "is-active", PROTECTED_SERVICE],
-            capture_output=True,
-            text=True,
-        )
-        embed = discord.Embed(
-            title="🛠️ システム状態監視 ＆ 緊急制御パネル",
-            description=(
-                f"• **CPU 1分負荷**: `{load1:.2f}`\n"
-                f"• **ディスク使用率**: `{disk_pct:.1f}%`\n"
-                f"• **保護対象サービス (`{PROTECTED_SERVICE}`)**: `{svc_res.stdout.strip()}`\n"
-                f"• **アーム状態**: `{'動作中' if is_busy else '待機中'}`"
-            ),
-            color=0x38BDF8,
-        )
-        await message.reply(embed=embed, view=SystemControlView())
-        return
+    dlog("DISCORD_MSG", f"受信 [{message.channel} / {message.author}]: {user_text}", "INFO")
 
-    if is_busy:
-        await message.reply("⚠️ 現在タスク実行中です。緊急停止したい場合は `!control` と入力して停止ボタンを押してください。")
-        return
-
-    async with message.channel.typing():
-        hw_context = get_hardware_and_world_context()
-        full_prompt = f"{hw_context}\n\n[ユーザーからの発話]:\n{user_text}"
-
-        plan = await asyncio.to_thread(planner.plan, full_prompt)
-
-        reply_text = plan.get("reply_text", "了解しました。")
-        tasks_list = plan.get("tasks") or []
-
-        if not tasks_list:
-            await message.reply(f"💬 **TACHIKOMA:** {reply_text}")
+    try:
+        if user_text in ("!control", "!status"):
+            embed = await asyncio.to_thread(build_status_embed_sync)
+            await message.reply(embed=embed, view=SystemControlView())
+            dlog("DISCORD_MSG", "!control パネルを送信しました", "OK")
             return
 
-        embed = discord.Embed(
-            title="📋 TACHIKOMA タスク実行プラン",
-            description=f"💬 {reply_text}\n\n**立案されたサブタスク ({len(tasks_list)}件):**",
-            color=0x38BDF8,
-        )
+        if is_busy:
+            await message.reply("⚠️ 現在タスク実行中です。緊急停止したい場合は `!control` と入力して停止ボタンを押してください。")
+            return
 
-        for i, t in enumerate(tasks_list, 1):
-            p = t.get("pick", {})
-            d = t.get("place", {})
-            desc = t.get("description", f"物体移動 #{i}")
+        async with message.channel.typing():
+            hw_context = await asyncio.to_thread(get_hardware_and_world_context)
+            full_prompt = f"{hw_context}\n\n[ユーザーからの発話]:\n{user_text}"
 
-            p_r = p.get("r", 0.0) * 100.0
-            p_th = p.get("theta_deg", 0.0)
-            p_z = p.get("z", 0.015) * 1000.0
-            p_roll = p.get("wrist_roll_deg", p.get("roll_deg", 0.0))
+            dlog("LLM_PLAN", "LLMTaskPlanner.plan() を呼び出し中...", "DEBUG")
+            plan = await asyncio.to_thread(planner.plan, full_prompt)
 
-            d_r = d.get("r", 0.0) * 100.0
-            d_th = d.get("theta_deg", 0.0)
-            d_z = d.get("z", 0.015) * 1000.0
-            d_roll = d.get("wrist_roll_deg", d.get("roll_deg", 0.0))
+            reply_text = plan.get("reply_text", "了解しました。")
+            tasks_list = plan.get("tasks") or []
+            dlog("LLM_PLAN", f"プラン生成完了 (サブタスク数: {len(tasks_list)})", "OK")
 
-            field_val = (
-                f"• **Pick** : $r$={p_r:4.1f}cm, $\\theta$={p_th:+5.1f}°, $z$={p_z:4.1f}mm, Roll(ID5)={p_roll:+5.1f}°\n"
-                f"• **Place**: $r$={d_r:4.1f}cm, $\\theta$={d_th:+5.1f}°, $z$={d_z:4.1f}mm, Roll(ID5)={d_roll:+5.1f}°"
+            if not tasks_list:
+                await message.reply(f"💬 **TACHIKOMA:** {reply_text}")
+                return
+
+            embed = discord.Embed(
+                title="📋 TACHIKOMA タスク実行プラン",
+                description=f"💬 {reply_text}\n\n**立案されたサブタスク ({len(tasks_list)}件):**",
+                color=0x38BDF8,
             )
 
-            embed.add_field(
-                name=f"Step {i}: {desc}",
-                value=field_val,
-                inline=False,
-            )
+            for i, t in enumerate(tasks_list, 1):
+                p = t.get("pick", {})
+                d = t.get("place", {})
+                desc = t.get("description", f"物体移動 #{i}")
 
-        view = TaskConfirmView(tasks_list=tasks_list, user_id=message.author.id)
-        await message.reply(embed=embed, view=view)
+                p_r = p.get("r", 0.0) * 100.0
+                p_th = p.get("theta_deg", 0.0)
+                p_z = p.get("z", 0.015) * 1000.0
+                p_roll = p.get("wrist_roll_deg", p.get("roll_deg", 0.0))
+
+                d_r = d.get("r", 0.0) * 100.0
+                d_th = d.get("theta_deg", 0.0)
+                d_z = d.get("z", 0.015) * 1000.0
+                d_roll = d.get("wrist_roll_deg", d.get("roll_deg", 0.0))
+
+                field_val = (
+                    f"• **Pick** : $r$={p_r:4.1f}cm, $\\theta$={p_th:+5.1f}°, $z$={p_z:4.1f}mm, Roll(ID5)={p_roll:+5.1f}°\n"
+                    f"• **Place**: $r$={d_r:4.1f}cm, $\\theta$={d_th:+5.1f}°, $z$={d_z:4.1f}mm, Roll(ID5)={d_roll:+5.1f}°"
+                )
+
+                embed.add_field(
+                    name=f"Step {i}: {desc}",
+                    value=field_val,
+                    inline=False,
+                )
+
+            view = TaskConfirmView(tasks_list=tasks_list, user_id=message.author.id)
+            await message.reply(embed=embed, view=view)
+
+    except Exception as e:
+        derr("ON_MESSAGE", f"メッセージ処理中に例外が発生しました (入力: {user_text})", e)
+        await message.reply(f"❌ **内部エラーが発生しました (`{type(e).__name__}`)**: `{e}`\n※ターミナルのスタックトレースを確認してください。")
 
 
 def main():
     global follower
     parser = argparse.ArgumentParser(description="TACHIKOMA Discord Bridge")
     parser.add_argument("--arm", action="store_true", help="実機フォロワー接続を有効化")
+    parser.add_argument("--no-stream", action="store_true", help="MJPEGカメラ配信サーバーを無効化")
     args = parser.parse_args()
+
+    dlog("STARTUP", "=== TACHIKOMA Discord Bot 起動シーケンス開始 ===", "INFO")
+    dlog("STARTUP", f"BASE_DIR: {BASE_DIR}", "DEBUG")
+    dlog("STARTUP", f"CAMERA_DEVICE_PATH: {CAMERA_DEVICE_PATH} (Index: {CAMERA_DEVICE_INDEX})", "DEBUG")
 
     if args.arm:
         try:
             follower = STS3215Driver(FOLLOWER_PORT, baudrate=BAUDRATE, timeout=0.01)
-            print(f"✅ 実機フォロワー接続完了 ({FOLLOWER_PORT})")
+            dlog("STARTUP", f"実機フォロワー接続完了 ({FOLLOWER_PORT})", "OK")
         except Exception as e:
-            print(f"⚠️ 実機接続失敗: {e}")
+            derr("STARTUP", f"実機フォロワー ({FOLLOWER_PORT}) の接続に失敗しました", e)
             follower = None
+    else:
+        dlog("STARTUP", "--arm フラグ未指定のため、アーム未接続(シミュレーション/監視モード)で起動します", "INFO")
+
+    if not args.no_stream:
+        start_mjpeg_server_daemon()
+    else:
+        dlog("STARTUP", "--no-stream フラグによりMJPEG配信サーバーをスキップしました", "INFO")
 
     if not DISCORD_TOKEN:
-        print("❌ エラー: .env に DISCORD_BOT_TOKEN が設定されていません。")
+        dlog("STARTUP", ".env に DISCORD_BOT_TOKEN が設定されていません。終了します。", "ERR")
         return
+
+    if not GEMINI_API_KEY:
+        dlog("STARTUP", ".env に GEMINI_API_KEY / GOOGLE_API_KEY が見つかりません。AI診断ボタンを押すとエラーになります。", "WARN")
 
     bot.run(DISCORD_TOKEN)
 
