@@ -55,7 +55,21 @@ class LLMTaskPlanner:
         self.api_key = api_key or os.getenv("GEMINI_API_KEY")
         if not self.api_key:
             raise ValueError("❌ GEMINI_API_KEY が見つかりません。.env を確認してください。")
-        self.client = genai.Client(api_key=self.api_key)
+        
+        # 👇 【追加・変更】SDK内部の自動リトライを無効化(attempts=1)し、15秒でタイムアウトさせる
+        http_opts = None
+        try:
+            http_opts = types.HttpOptions(
+                timeout=15000,  # 15秒 (ミリ秒指定)
+                retry_options=types.HttpRetryOptions(attempts=1),
+            )
+        except Exception:
+            try:
+                http_opts = types.HttpOptions(timeout=15000)
+            except Exception:
+                http_opts = None
+
+        self.client = genai.Client(api_key=self.api_key, http_options=http_opts) if http_opts else genai.Client(api_key=self.api_key)
 
         if candidate_models is None:
             self.candidate_models = [
