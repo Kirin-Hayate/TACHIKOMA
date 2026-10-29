@@ -161,6 +161,33 @@ def get_connected_hardware_list() -> List[str]:
 
     return hw_items
 
+def get_hardware_and_world_context() -> str:
+    """現在のハードウェア接続状態と最新ワールドステートの要約文を生成する"""
+    hw_list = get_connected_hardware_list()
+    hw_summary = "\n".join(f"- {item}" for item in hw_list)
+
+    world_state = orchestrator.get_current_world_state() if orchestrator else {}
+    objs = world_state.get("objects", [])
+    updated_at = world_state.get("updated_at", "未計測")
+    total_objs = world_state.get("total_objects", len(objs))
+
+    if objs:
+        lines = [
+            f"- [ID #{o.get('id')}] 名称: {o.get('name', '物体')}, 色: {o.get('color', '不明')}, "
+            f"座標: (X={o.get('x_mm', 0):.1f}mm, Y={o.get('y_mm', 0):.1f}mm, Z={o.get('z_mm', 0):.1f}mm)"
+            for o in objs
+        ]
+        objects_summary = f"【机の上にある検知済み物体リスト (最終更新: {updated_at}, 計{total_objs}個)】:\n" + "\n".join(lines)
+    else:
+        objects_summary = f"現在、机の上に検知された物体データはありません (最終確認: {updated_at})。"
+
+    return f"""
+[現在のタチコマ物理環境ステータス]
+{hw_summary}
+- 机上認識状況:
+{objects_summary}
+※机の上の状況や確認日時、接続状態を尋ねられた場合は、上記の実測情報を基に回答してください。
+"""
 
 # ==============================================================================
 # 2. スマホ最適化 緊急制御パネル UI (SystemControlView)
@@ -179,9 +206,22 @@ class SystemControlView(View):
             await interaction.followup.send("⚠️ オーケストレーターが初期化されていません。")
             return
 
+        # 1. カメラ画像 (生フレーム or マーカー注釈付き) を取得
+        jpeg_bytes, snap_err = await asyncio.to_thread(orchestrator.vision.capture_annotated_snapshot)
+        
+        # 2. 机上認識・ワールドステート更新 (ArUcoマーカーがあれば更新)
         success, new_state, msg = await asyncio.to_thread(orchestrator.refresh_vision, None, False)
         obj_count = new_state.get("total_objects", 0)
-        await interaction.followup.send(f"📸 **机上スキャン完了**: {msg} (検知物体数: `{obj_count}` 個)")
+        updated_at = new_state.get("updated_at", "不明")
+
+        content = f"📸 **机上スキャン実行結果**\n• {msg}\n• 認識物体数: `{obj_count}` 個 (最終更新: `{updated_at}`)"
+
+        # 画像が取得できていれば添付して送信
+        if jpeg_bytes:
+            file = discord.File(io.BytesIO(jpeg_bytes), filename="tabletop_snapshot.jpg")
+            await interaction.followup.send(content=content, file=file)
+        else:
+            await interaction.followup.send(content=f"{content}\n⚠️ 画像の取得に失敗しました: {snap_err}")
 
     @discord.ui.button(label="🧠 AI診断", style=discord.ButtonStyle.primary, custom_id="sys_ai_diag", row=0)
     async def ai_diagnosis(self, interaction: discord.Interaction, button: Button):
@@ -444,7 +484,10 @@ async def on_message(message: discord.Message):
 
         # 司令塔 orchestrator に指示を丸ごと委譲
         async with message.channel.typing():
-            res = await asyncio.to_thread(orchestrator.process_instruction, user_text, True)
+            hw_context = await asyncio.to_thread(get_hardware_and_world_context)
+            augmented_instruction = f"{hw_context}\n\n[ユーザーの発話]:\n{user_text}"
+
+            res = await asyncio.to_thread(orchestrator.process_instruction, augmented_instruction, True)
 
             reply_text = res.get("reply_text", "了解いたしました！")
             tasks_list = res.get("tasks") or []
