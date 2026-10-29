@@ -428,6 +428,9 @@ async def on_ready():
     if not security_monitor_task.is_running():
         security_monitor_task.start()
 
+    # 内部ストリーミングサーバーの起動
+    await start_mjpeg_server()
+
     guild_info = f" (対象Guild: {TARGET_GUILD_ID})" if TARGET_GUILD_ID else " (全サーバー対象)"
     dlog("BOT_READY", f"TACHIKOMA Discord Bot 起動完了: {bot.user.name} ({bot.user.id}){guild_info}", "OK")
     dlog("BOT_READY", f"Sentinel監視稼働中 (通知先Ch: {ALERT_CHANNEL_ID}, 保護SVC: {DEFAULT_PROTECTED_SERVICE})", "INFO")
@@ -592,6 +595,65 @@ def main():
         return
 
     bot.run(DISCORD_TOKEN)
+
+
+# ==============================================================================
+# 内部 MJPEG ストリーミングサーバー (ポート 8088: Tailscale Funnel / ライブ用)
+# ==============================================================================
+from aiohttp import web
+
+STREAM_PORT = 8088
+
+async def mjpeg_stream_handler(request):
+    """ブラウザ向け MJPEG ストリーム配信ハンドラ"""
+    response = web.StreamResponse(
+        status=200,
+        reason='OK',
+        headers={
+            'Content-Type': 'multipart/x-mixed-replace; boundary=frame',
+            'Cache-Control': 'no-cache, no-store, must-revalidate',
+            'Pragma': 'no-cache',
+            'Expires': '0',
+            'Connection': 'close',
+        }
+    )
+    await response.prepare(request)
+
+    try:
+        while True:
+            # orchestrator の視覚パイプラインから最新の JPEG フレームを取得
+            if orchestrator and orchestrator.vision:
+                jpeg_bytes, _ = orchestrator.vision.capture_annotated_snapshot()
+            else:
+                jpeg_bytes = None
+
+            if jpeg_bytes:
+                header = (
+                    b"--frame\r\n"
+                    b"Content-Type: image/jpeg\r\n"
+                    b"Content-Length: " + str(len(jpeg_bytes)).encode() + b"\r\n\r\n"
+                )
+                await response.write(header + jpeg_bytes + b"\r\n")
+            
+            # 約15fpsで配信 (負荷軽減)
+            await asyncio.sleep(0.066)
+    except (asyncio.CancelledError, ConnectionResetError):
+        pass
+    return response
+
+
+async def start_mjpeg_server():
+    """Bot と同時にバックグラウンドで HTTP 配信サーバーを起動"""
+    app = web.Application()
+    app.router.add_get('/', mjpeg_stream_handler)
+    app.router.add_get('/stream', mjpeg_stream_handler)
+    app.router.add_get('/snapshot', mjpeg_stream_handler)
+    
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, host='127.0.0.1', port=STREAM_PORT)
+    await site.start()
+    dlog("STREAM", f"内部 MJPEG ストリーミングサーバー起動完了 (http://127.0.0.1:{STREAM_PORT})", "OK")
 
 
 if __name__ == "__main__":
