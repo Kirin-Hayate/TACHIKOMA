@@ -11,7 +11,7 @@ MuJoCo 3Dシミュレーションビューア管理モジュール (core/sim_vie
 import os
 import mujoco
 import mujoco.viewer
-from core.kinematics import raw_to_radian
+from services.arm_worker.kinematics import raw_to_radian
 from config.joint_config import SERVO_IDS
 
 

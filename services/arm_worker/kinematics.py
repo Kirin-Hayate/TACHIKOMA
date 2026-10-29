@@ -69,7 +69,7 @@ COUNTS_PER_RAD = 4096.0 / (2.0 * math.pi)
 # ==============================================================================
 # MuJoCo IK 専用内部モデルの読み込み (HAS_MUJOCO 有効時のみ初期化)
 # ==============================================================================
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 XML_PATH = os.path.join(BASE_DIR, "assets", "so100_scene.xml")
 
 _IK_MODEL = None

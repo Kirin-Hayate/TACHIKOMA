@@ -27,6 +27,29 @@ TACHIKOMA 統合モーション自動再生スクリプト (ラジアン統一�
       python src/replay_main.py motions/rad_test.csv --arm --sim --speed 0.5
 ==============================================================================
 """
+"""
+==============================================================================
+TACHIKOMA 統合モーション自動再生スクリプト (ラジアン統一・速度制御版)
+(src/replay_main.py) [4層アーキテクチャ対応版]
+==============================================================================
+【役割】
+指定された複数の CSV モーションファイルを、それぞれの指定回数ずつ順番に連続再生します。
+内部演算・軌道制御を「物理関節ラジアン」で統一し、機体の個体差や再組み立ての影響を受けない
+高精度な再生を実現しています。
+--arm（実機） / --sim（3D画面） / --speed（再生速度倍率）により安全な検証が可能です。
+
+【安全機能】
+1. 再生速度スケーリング (--speed)
+   実機テスト時の安全のため、任意の倍率（例: 0.5倍速）で全シーケンスを低速実行可能。
+2. 起動直後の安全初期化（急発進防止）
+   トルクOFFの状態で実機の静止角度を読み取ってラジアン換算し、そこからトルクをONにして
+   初速0のコサインS字加減速でゆっくり規定のHome位置へ遷移します。
+3. 物理ラジアン空間でのコサイン補間（S字カーブ加減速）
+   動作中・終了時・Rキー復帰時のすべての遷移で加速度を連続にし、急激な負荷を防ぎます。
+4. 実機通信境界での一括 Raw 値変換
+   実機サーボへの送信直前にのみ radian_to_raw() を通して書き込みます。
+==============================================================================
+"""
 
 import sys
 import time
@@ -36,7 +59,7 @@ import math
 import argparse
 
 # ==============================================================================
-# 1. 共通モジュール・設定のインポート
+# 1. 共通モジュール・設定のインポート (現在のフォルダ階層に対応)
 # ==============================================================================
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if BASE_DIR not in sys.path:
@@ -48,13 +71,22 @@ from config.joint_config import (
     SERVO_IDS,
     JOINT_CONFIG
 )
-from core.sts3215 import STS3215Driver
-from core.kinematics import (
+# drivers / services/arm_worker 配下の最新配置からインポート
+from drivers.sts3215 import STS3215Driver
+from services.arm_worker.kinematics import (
     raw_to_radian,
     radian_to_raw,
     get_home_radians
 )
-from core.sim_viewer import MujocoSimViewer
+
+# sim_viewer の安全インポート (archive 等に退避されている場合を考慮)
+try:
+    from core.sim_viewer import MujocoSimViewer
+except ImportError:
+    try:
+        from core.sim_viewer import MujocoSimViewer
+    except ImportError:
+        MujocoSimViewer = None
 
 # ==============================================================================
 # 2. 安全動作パラメータ基準設定 (秒単位, speed=1.0 基準)
@@ -198,8 +230,11 @@ def main():
     raw_file_items = args.files
 
     if not enable_follower and not enable_sim:
-        print("💡 --arm も --sim も指定されていないため、デフォルトで [--sim] (3D画面表示) を有効化します。")
-        enable_sim = True
+        if MujocoSimViewer is not None:
+            print("💡 --arm も --sim も指定されていないため、デフォルトで [--sim] (3D画面表示) を有効化します。")
+            enable_sim = True
+        else:
+            print("💡 ドライラン検証モード（実機・3D画面なし）で実行します。")
 
     # 速度倍率に応じたアプローチ時間の計算
     startup_home_dur = BASE_STARTUP_HOME_DURATION / speed
@@ -230,7 +265,7 @@ def main():
 
     print("==================================================")
     print(f" 🎬 TACHIKOMA 統合モーションシーケンス再生 (ラジアン統一版)")
-    print(f" ⚙️ 有効機能: {' + '.join(mode_list)}")
+    print(f" ⚙️ 有効機能: {' + '.join(mode_list) if mode_list else 'ドライランのみ'}")
     print(f" ⏩ 再生速度: {speed:.2f}倍速 (所要時間: 約 {1.0/speed:.2f}倍)")
     print(f" 📋 再生シーケンス (全 {len(loaded_motions)} モーション):")
     for idx, item in enumerate(loaded_motions, start=1):
@@ -253,11 +288,15 @@ def main():
         print("💡 --arm が指定されていないため、実機送信は行いません。")
 
     if enable_sim:
-        try:
-            sim = MujocoSimViewer()
-            print("✅ 3Dシミュレータ初期化完了")
-        except Exception as e:
-            print(f"⚠️ 3Dシミュレータ初期化失敗: {e}")
+        if MujocoSimViewer is not None:
+            try:
+                sim = MujocoSimViewer()
+                print("✅ 3Dシミュレータ初期化完了")
+            except Exception as e:
+                print(f"⚠️ 3Dシミュレータ初期化失敗: {e}")
+                sim = None
+        else:
+            print("⚠️ MujocoSimViewer がインポートできないため、3D画面表示をスキップします。")
             sim = None
 
     try:
