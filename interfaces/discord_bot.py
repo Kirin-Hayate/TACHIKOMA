@@ -1,6 +1,6 @@
 """
 ==============================================================================
-TACHIKOMA Discord Bridge (interfaces/discord_bot.py)
+TACHIKOMA Discord Bridge (interfaces/discord_bot.py) [Orchestrator統合版]
 ==============================================================================
 【概要】
 本モジュールは、TACHIKOMA システムの Layer 1 (インターフェース層) を担当する
@@ -11,18 +11,15 @@ Layer 1: インターフェース層 (入出力・UI・通知)
 
 【設計方針と責務分離】
 1. UI・通知特化 (薄いインターフェース):
-   - システム監視・自律防衛ループ、OS遮断操作、Gemini AI診断の実体はすべて
-     Layer 3 の専門サービス (services/sentinel/) に完全委譲。
-   - モデル指定も config/model_config.py から一括参照し、ハードコードを排除。
-2. 段階的防衛通知 (Tiered Defense):
+   - 会話・タスク分解・IK事前検証・搬送制御・再スキャンは Layer 2 (core/orchestrator.py) に委譲。
+   - サーバー防衛・メトリクス監視・AI診断は Layer 3 (services/sentinel/) に委譲。
+2. 承認ワークフロー (TaskConfirmView):
+   - 立案された Pick & Place サブタスク一覧、IK到達性、自動生成されたモーションCSVを表示。
+   - ユーザーのボタン押下により安全に実行開始。
+3. 段階的防衛通知 (Tiered Defense):
    - discord.ext.tasks による 2分間隔の巡回監視ループ。
-   - レベル1 (警告通知: クールタイムあり) / レベル2 (自動防衛: クールタイム無視・即時報告)。
-3. スマホ最適化 UI (SystemControlView):
-   - 3段グリッド配置による片手操作対応。
-   - 永続化 View (timeout=None) により Bot 再起動後も既存メッセージのボタンが有効。
 4. ノートPC / ローカル開発環境保護:
-   - 外部ハードウェアや Linux デーモンが存在しない開発機でもエラー落ちせず、
-     安全に起動・UI表示テストが完結。
+   - 実機未接続時はドライランとして安全に稼働し、--test-ui でUI検証が完結。
 ==============================================================================
 """
 
@@ -69,20 +66,18 @@ from services.sentinel.system_monitor import (
     ALERT_COOLDOWN_SEC,
 )
 
-# --- ハードウェア・アーム既存モジュール ---
+# --- 司令塔・Worker モジュール ---
+from core.orchestrator import TachikomaOrchestrator
+from services.arm_worker.motion_executor import MotionExecutor
+
 try:
     from config.joint_config import FOLLOWER_PORT, BAUDRATE, SERVO_IDS
-    from core.llm_planner import LLMTaskPlanner
     from drivers.sts3215 import STS3215Driver
-    from services.arm_worker.motion_generator import ParametricMotionGenerator
-    from services.arm_worker.kinematics import raw_to_radian, radian_to_raw, get_home_radians
 except ImportError:
     FOLLOWER_PORT = "/dev/ttyUSB0"
     BAUDRATE = 1000000
     SERVO_IDS = [1, 2, 3, 4, 5, 6]
-    LLMTaskPlanner = None
     STS3215Driver = None
-    ParametricMotionGenerator = None
 
 
 # ==============================================================================
@@ -110,18 +105,16 @@ TARGET_GUILD_ID = int(os.getenv("DISCORD_GUILD_ID")) if os.getenv("DISCORD_GUILD
 ALERT_CHANNEL_ID = int(os.getenv("DISCORD_ALERT_CHANNEL_ID")) if os.getenv("DISCORD_ALERT_CHANNEL_ID") else None
 
 CAMERA_DEVICE_INDEX = int(os.getenv("CAMERA_DEVICE_INDEX", "0"))
-CAMERA_DEVICE_PATH = os.getenv("CAMERA_DEVICE_PATH", f"/dev/video{CAMERA_DEVICE_INDEX}")
 STREAM_EXTERNAL_URL = os.getenv("STREAM_EXTERNAL_URL", "").strip()
 
 # 実行状態フラグ
 is_busy = False
-abort_arm_flag = False
 last_alert_time = 0.0
 
-# コアインスタンスの初期化
-planner = LLMTaskPlanner() if LLMTaskPlanner else None
-generator = ParametricMotionGenerator() if ParametricMotionGenerator else None
-follower = None
+# ハードウェアドライバ・司令塔オーケストレーター初期化
+follower: Optional[Any] = None
+motion_executor: Optional[MotionExecutor] = None
+orchestrator: Optional[TachikomaOrchestrator] = None
 
 # Discord クライアントの初期化
 intents = discord.Intents.default()
@@ -130,7 +123,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 
 # ==============================================================================
-# 1. 接続ハードウェア走査・物理コンテキスト生成 (State Manager 移行準備)
+# 1. 接続ハードウェア走査・物理コンテキスト生成
 # ==============================================================================
 def get_connected_hardware_list() -> List[str]:
     hw_items = []
@@ -140,14 +133,14 @@ def get_connected_hardware_list() -> List[str]:
     elif os.path.exists(FOLLOWER_PORT):
         hw_items.append(f"🦾 **アーム**: ポート認識済・未オープン (`{FOLLOWER_PORT}`)")
     else:
-        hw_items.append(f"🦾 **アーム**: 未接続 (`{FOLLOWER_PORT}` 非存在)")
+        hw_items.append(f"🦾 **アーム**: 未接続 (`{FOLLOWER_PORT}` 非存在 / ドライラン)")
 
     # (2) カメラ確認
     video_devs = sorted(glob.glob("/dev/video*"))
     if video_devs:
         hw_items.append(f"📷 **カメラ**: 認識済 (`{', '.join(video_devs)}`)")
     else:
-        hw_items.append("📷 **カメラ**: 未接続 (`/dev/video*` なし)")
+        hw_items.append("📷 **カメラ**: 未接続 (プレースホルダーモード)")
 
     # (3) 外部ストレージ確認
     try:
@@ -169,85 +162,8 @@ def get_connected_hardware_list() -> List[str]:
     return hw_items
 
 
-def get_hardware_and_world_context() -> str:
-    hw_list = get_connected_hardware_list()
-    hw_summary = "\n".join(f"- {item}" for item in hw_list)
-
-    world_state_path = os.path.join(BASE_DIR, "config", "current_world_state.json")
-    objects_summary = "現在、机の上に検知された物体データはありません（空の状態または未計測）。"
-
-    if os.path.exists(world_state_path):
-        try:
-            with open(world_state_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                objs = data.get("objects", [])
-                if objs:
-                    lines = [
-                        f"- [ID #{o.get('id')}] 名称: {o.get('name', '物体')}, 色: {o.get('color', '不明')}, "
-                        f"座標: (X={o.get('x_mm', 0):.1f}mm, Y={o.get('y_mm', 0):.1f}mm, Z={o.get('z_mm', 0):.1f}mm)"
-                        for o in objs
-                    ]
-                    objects_summary = "【机の上にある検知済み物体リスト】:\n" + "\n".join(lines)
-        except Exception as e:
-            derr("WORLD_CTX", f"{world_state_path} 読み込み失敗", e)
-
-    return f"""
-[現在のタチコマ物理環境ステータス]
-{hw_summary}
-- 机上認識状況:
-{objects_summary}
-※机の上の状況や接続状態を尋ねられた場合は、上記の実測情報を基に正確に回答してください。
-"""
-
-
 # ==============================================================================
-# 2. 実機サーボ搬送シーケンス (Motion Executor 移行準備)
-# ==============================================================================
-def execute_tasks_sync(tasks_list: List[Dict[str, Any]]) -> str:
-    global follower, abort_arm_flag
-    abort_arm_flag = False
-
-    if follower is None or not getattr(follower, "is_open", False):
-        dlog("ARM_EXEC", "実機アーム未接続のためシミュレーション動作", "WARN")
-        return "⚠️ 実機アームが接続されていません（プレビューのみモード）"
-
-    try:
-        dlog("ARM_EXEC", f"搬送シーケンス開始 (全 {len(tasks_list)} ステップ)", "INFO")
-        for sid in SERVO_IDS:
-            follower.set_torque(sid, True)
-
-        for idx, task in enumerate(tasks_list, 1):
-            if abort_arm_flag:
-                emergency_stop_arm(follower)
-                return "🛑 緊急停止ボタンによりタスクを即座に中断し、脱力しました。"
-
-            p = task.get("pick")
-            d = task.get("place")
-            if not generator:
-                continue
-            success, frames, _ = generator.generate_from_coords(p, d)
-            if not success:
-                continue
-
-            for _, rad_positions in frames:
-                if abort_arm_flag:
-                    emergency_stop_arm(follower)
-                    return "🛑 緊急停止ボタンにより動作を即時中断し、脱力しました。"
-                for sid in SERVO_IDS:
-                    raw_val = radian_to_raw(sid, rad_positions[sid])
-                    follower.write_position(sid, raw_val)
-                time.sleep(0.02)
-
-        return "✅ すべての搬送タスクが正常に完了しました。"
-    except Exception as e:
-        derr("ARM_EXEC", "実機搬送中に例外発生", e)
-        return f"❌ 実行中エラー: {e}"
-    finally:
-        emergency_stop_arm(follower)
-
-
-# ==============================================================================
-# 3. スマホ最適化 緊急制御パネル UI (SystemControlView)
+# 2. スマホ最適化 緊急制御パネル UI (SystemControlView)
 # ==============================================================================
 class SystemControlView(View):
     def __init__(self):
@@ -255,10 +171,17 @@ class SystemControlView(View):
         if STREAM_EXTERNAL_URL:
             self.add_item(Button(label="📹 ライブ", style=discord.ButtonStyle.link, url=STREAM_EXTERNAL_URL, row=0))
 
-    @discord.ui.button(label="📸 撮影", style=discord.ButtonStyle.secondary, custom_id="sys_cam_snap", row=0)
+    @discord.ui.button(label="📸 撮影/再スキャン", style=discord.ButtonStyle.secondary, custom_id="sys_cam_snap", row=0)
     async def snap_camera(self, interaction: discord.Interaction, button: Button):
-        dlog("UI_BTN", f"[📸 撮影] 押下 (User: {interaction.user})", "INFO")
-        await interaction.response.send_message("📸 **カメラ撮影を要求しました（Phase 2で本格統合予定）**")
+        dlog("UI_BTN", f"[📸 撮影/再スキャン] 押下 (User: {interaction.user})", "INFO")
+        await interaction.response.defer()
+        if orchestrator is None:
+            await interaction.followup.send("⚠️ オーケストレーターが初期化されていません。")
+            return
+
+        success, new_state, msg = await asyncio.to_thread(orchestrator.refresh_vision, None, False)
+        obj_count = new_state.get("total_objects", 0)
+        await interaction.followup.send(f"📸 **机上スキャン完了**: {msg} (検知物体数: `{obj_count}` 個)")
 
     @discord.ui.button(label="🧠 AI診断", style=discord.ButtonStyle.primary, custom_id="sys_ai_diag", row=0)
     async def ai_diagnosis(self, interaction: discord.Interaction, button: Button):
@@ -269,7 +192,6 @@ class SystemControlView(View):
         )
 
         async with interaction.channel.typing():
-            # Sentinel モジュールへ処理を完全委譲
             success, diag_text, used_model, elapsed = await asyncio.to_thread(run_ai_security_diagnosis_sync)
 
         embed = discord.Embed(
@@ -282,15 +204,15 @@ class SystemControlView(View):
 
     @discord.ui.button(label="🛑 アーム", style=discord.ButtonStyle.danger, custom_id="sys_stop_arm", row=1)
     async def stop_arm(self, interaction: discord.Interaction, button: Button):
-        global is_busy, abort_arm_flag, follower
+        global is_busy
         dlog("UI_BTN", "[🛑 アーム] 緊急停止押下", "WARN")
         await interaction.response.defer()
-        abort_arm_flag = True
         is_busy = False
 
-        # Sentinel のアーム緊急停止を呼び出し
+        if orchestrator is not None:
+            orchestrator.trigger_abort()
         success, msg = emergency_stop_arm(follower)
-        await interaction.followup.send(msg)
+        await interaction.followup.send(f"🛑 **緊急停止実行**: {msg}")
 
     @discord.ui.button(label="🛑 Web", style=discord.ButtonStyle.danger, custom_id="sys_stop_service", row=1)
     async def stop_web_service(self, interaction: discord.Interaction, button: Button):
@@ -320,7 +242,7 @@ class SystemControlView(View):
 
 
 # ==============================================================================
-# 4. 段階的セキュリティ監視タスク (Sentinel 連携)
+# 3. 段階的セキュリティ監視タスク (Sentinel 連携)
 # ==============================================================================
 @tasks.loop(minutes=2)
 async def security_monitor_task():
@@ -332,7 +254,6 @@ async def security_monitor_task():
     if channel is None:
         return
 
-    # Sentinel モジュールの検査関数を呼び出し
     warnings, auto_actions = await asyncio.to_thread(check_system_security_sync)
 
     if auto_actions:
@@ -358,7 +279,7 @@ async def security_monitor_task():
 
 
 # ==============================================================================
-# 5. ステータスパネル Embed 生成
+# 4. ステータスパネル Embed 生成
 # ==============================================================================
 def build_status_embed_sync() -> discord.Embed:
     usage = shutil.disk_usage("/")
@@ -371,6 +292,8 @@ def build_status_embed_sync() -> discord.Embed:
     hw_block = "\n".join(f"• {item}" for item in hw_items)
 
     candidates = get_candidate_models()
+    world_state = orchestrator.get_current_world_state() if orchestrator else {}
+    obj_count = world_state.get("total_objects", 0)
 
     desc = (
         f"**【システムメトリクス】**\n"
@@ -378,7 +301,8 @@ def build_status_embed_sync() -> discord.Embed:
         f"• **メモリ使用率**: `{mem.percent:.1f}%` (`{mem.used // (1024**2)}MB` / `{mem.total // (1024**2)}MB`)\n"
         f"• **ディスク使用率**: `{disk_pct:.1f}%`\n"
         f"• **保護対象サービス (`{DEFAULT_PROTECTED_SERVICE}`)**: `{svc_state}`\n"
-        f"• **アーム状態**: `{'動作中' if is_busy else '待機中'}`\n\n"
+        f"• **アーム状態**: `{'動作中' if is_busy else '待機中'}`\n"
+        f"• **机上認識物体**: `{obj_count}` 個検知\n\n"
         f"**【接続ハードウェア一覧】**\n"
         f"{hw_block}"
     )
@@ -389,13 +313,13 @@ def build_status_embed_sync() -> discord.Embed:
 
 
 # ==============================================================================
-# 6. タスク確認 UI (TaskConfirmView)
+# 5. タスク確認 UI (TaskConfirmView - Orchestrator連携)
 # ==============================================================================
 class TaskConfirmView(View):
-    def __init__(self, tasks_list: List[Dict[str, Any]], user_id: int):
+    def __init__(self, user_id: int, preview_csvs: Optional[List[str]] = None):
         super().__init__(timeout=120.0)
-        self.tasks = tasks_list
         self.user_id = user_id
+        self.preview_csvs = preview_csvs or []
 
     @discord.ui.button(label="🤖 実機で実行する", style=discord.ButtonStyle.green, emoji="▶️")
     async def confirm(self, interaction: discord.Interaction, button: Button):
@@ -408,19 +332,37 @@ class TaskConfirmView(View):
             await interaction.response.send_message("⚠️ 現在別のアクションを実行中です。", ephemeral=True)
             return
 
+        if orchestrator is None:
+            await interaction.response.send_message("⚠️ オーケストレーターがロードされていません。", ephemeral=True)
+            return
+
         await interaction.response.defer()
         is_busy = True
         for child in self.children:
             child.disabled = True
 
+        csv_info = f"\n📄 検証CSV: `{os.path.basename(self.preview_csvs[0])}`" if self.preview_csvs else ""
         await interaction.edit_original_response(
-            content="🦾 **TACHIKOMA が物理タスクを実行中... (緊急停止は `!control` から可能)**",
+            content=f"🦾 **TACHIKOMA が物理タスクを実行中...**{csv_info}\n*(緊急停止は `!stop` または `!control` から可能)*",
             view=self,
         )
 
-        result_msg = await asyncio.to_thread(execute_tasks_sync, self.tasks)
+        # 司令塔 orchestrator に実行を委譲 (完了後に自動机上再スキャン)
+        all_ok, exec_logs, updated_state = await asyncio.to_thread(
+            orchestrator.execute_approved_plan,
+            None,
+            True
+        )
         is_busy = False
-        await interaction.followup.send(result_msg)
+
+        status_icon = "✅" if all_ok else "⚠️"
+        result_embed = discord.Embed(
+            title=f"{status_icon} 物理搬送シーケンス完了報告",
+            description="\n".join(exec_logs),
+            color=0x22C55E if all_ok else 0xEAB308
+        )
+        result_embed.set_footer(text=f"最新机上物体数: {updated_state.get('total_objects', 0)} 個")
+        await interaction.followup.send(embed=result_embed)
 
     @discord.ui.button(label="キャンセル", style=discord.ButtonStyle.secondary, emoji="⏹️")
     async def cancel(self, interaction: discord.Interaction, button: Button):
@@ -429,13 +371,16 @@ class TaskConfirmView(View):
             return
 
         await interaction.response.defer()
+        if orchestrator is not None:
+            orchestrator.pending_plan = None
+
         for child in self.children:
             child.disabled = True
         await interaction.edit_original_response(content="🛑 **タスクをキャンセルしました。**", view=self)
 
 
 # ==============================================================================
-# 7. イベントハンドラ
+# 6. イベントハンドラ
 # ==============================================================================
 @bot.event
 async def on_ready():
@@ -470,29 +415,55 @@ async def on_message(message: discord.Message):
             await message.reply(embed=embed, view=SystemControlView())
             return
 
+        # 緊急停止コマンド
+        if user_text in ("!stop", "!abort"):
+            is_busy = False
+            if orchestrator is not None:
+                orchestrator.trigger_abort()
+            _, msg = emergency_stop_arm(follower)
+            await message.reply(f"🛑 **緊急停止指令を実行しました**: {msg}")
+            return
+
+        # 机上強制再スキャンコマンド
+        if user_text == "!scan":
+            async with message.channel.typing():
+                if orchestrator is None:
+                    await message.reply("⚠️ オーケストレーターが初期化されていません。")
+                    return
+                success, new_state, scan_msg = await asyncio.to_thread(orchestrator.refresh_vision, None, False)
+                await message.reply(f"📸 **机上スキャン完了**: {scan_msg} (物体数: `{new_state.get('total_objects', 0)}`)")
+            return
+
         if is_busy:
-            await message.reply("⚠️ 現在タスク実行中です。緊急停止したい場合は `!control` と入力して停止ボタンを押してください。")
+            await message.reply("⚠️ 現在タスク実行中です。緊急停止したい場合は `!stop` または `!control` を使用してください。")
             return
 
-        # 自然言語プランニング (LLMTaskPlanner)
-        if planner is None:
-            await message.reply("⚠️ プランナーがロードされていません。")
+        if orchestrator is None:
+            await message.reply("⚠️ オーケストレーターが初期化されていません。")
             return
 
+        # 司令塔 orchestrator に指示を丸ごと委譲
         async with message.channel.typing():
-            hw_context = await asyncio.to_thread(get_hardware_and_world_context)
-            full_prompt = f"{hw_context}\n\n[ユーザーからの発話]:\n{user_text}"
+            res = await asyncio.to_thread(orchestrator.process_instruction, user_text, True)
 
-            plan = await asyncio.to_thread(planner.plan, full_prompt)
-            reply_text = plan.get("reply_text", "了解しました。")
-            tasks_list = plan.get("tasks") or []
+            reply_text = res.get("reply_text", "了解いたしました！")
+            tasks_list = res.get("tasks") or []
+            ik_feasible = res.get("ik_feasible", True)
+            preview_csvs = res.get("preview_csvs", [])
 
+            # 物理動作を伴わない雑談・質問の場合
             if not tasks_list:
                 await message.reply(f"💬 **TACHIKOMA:** {reply_text}")
                 return
 
+            # IK 幾何学的解が見つからなかった場合
+            if not ik_feasible:
+                await message.reply(f"💬 **TACHIKOMA:** {reply_text}")
+                return
+
+            # 搬送タスク計画の Embed 構築
             embed = discord.Embed(
-                title="📋 TACHIKOMA タスク実行プラン",
+                title="📋 TACHIKOMA タスク実行プラン (IK検証済)",
                 description=f"💬 {reply_text}\n\n**立案されたサブタスク ({len(tasks_list)}件):**",
                 color=0x38BDF8,
             )
@@ -505,20 +476,22 @@ async def on_message(message: discord.Message):
                 p_r = p.get("r", 0.0) * 100.0
                 p_th = p.get("theta_deg", 0.0)
                 p_z = p.get("z", 0.015) * 1000.0
-                p_roll = p.get("wrist_roll_deg", p.get("roll_deg", 0.0))
 
                 d_r = d.get("r", 0.0) * 100.0
                 d_th = d.get("theta_deg", 0.0)
                 d_z = d.get("z", 0.015) * 1000.0
-                d_roll = d.get("wrist_roll_deg", d.get("roll_deg", 0.0))
 
                 field_val = (
-                    f"• **Pick** : $r$={p_r:4.1f}cm, $\\theta$={p_th:+5.1f}°, $z$={p_z:4.1f}mm, Roll={p_roll:+5.1f}°\n"
-                    f"• **Place**: $r$={d_r:4.1f}cm, $\\theta$={d_th:+5.1f}°, $z$={d_z:4.1f}mm, Roll={d_roll:+5.1f}°"
+                    f"• **Pick** : $r$={p_r:4.1f}cm, $\\theta$={p_th:+5.1f}°, $z$={p_z:4.1f}mm\n"
+                    f"• **Place**: $r$={d_r:4.1f}cm, $\\theta$={d_th:+5.1f}°, $z$={d_z:4.1f}mm"
                 )
                 embed.add_field(name=f"Step {i}: {desc}", value=field_val, inline=False)
 
-            view = TaskConfirmView(tasks_list=tasks_list, user_id=message.author.id)
+            if preview_csvs:
+                csv_names = [f"`{os.path.basename(p)}`" for p in preview_csvs]
+                embed.add_field(name="📄 検証用モーションCSV", value=", ".join(csv_names), inline=False)
+
+            view = TaskConfirmView(user_id=message.author.id, preview_csvs=preview_csvs)
             await message.reply(embed=embed, view=view)
 
     except Exception as e:
@@ -530,27 +503,14 @@ async def on_message(message: discord.Message):
 # メインエントリーポイント ＆ ノートPC単体テスト
 # ==============================================================================
 def main():
-    global follower
+    global follower, motion_executor, orchestrator
+
     parser = argparse.ArgumentParser(description="TACHIKOMA Discord Bridge (Layer 1)")
     parser.add_argument("--arm", action="store_true", help="実機フォロワー接続を有効化")
-    parser.add_argument("--test-ui", action="store_true", help="ノートPC用: Discordに接続せずUI Embed生成を単体テスト")
+    parser.add_argument("--test-ui", action="store_true", help="ノートPC用: Discordに接続せずUI・司令塔連携を単体テスト")
     args = parser.parse_args()
 
-    if args.test_ui:
-        print("=" * 70)
-        print("🧪 [TEST] interfaces/discord_bot.py UI・コンテキスト単体生成テスト")
-        print("=" * 70)
-        ctx = get_hardware_and_world_context()
-        print("1. 生成されたハードウェアコンテキスト:")
-        print(ctx[:300] + "...\n")
-        embed = build_status_embed_sync()
-        print(f"2. 生成された Embed タイトル: {embed.title}")
-        print(f"   Embed 説明文字数: {len(embed.description)} chars")
-        print(f"   Embed フッター: {embed.footer.text}")
-        print("=" * 70)
-        print("🎉 UI生成テストが正常に完了しました！")
-        return
-
+    # 実機アームの接続初期化
     if args.arm and STS3215Driver:
         try:
             follower = STS3215Driver(FOLLOWER_PORT, baudrate=BAUDRATE, timeout=0.01)
@@ -558,6 +518,31 @@ def main():
         except Exception as e:
             derr("STARTUP", f"実機フォロワー接続失敗: {e}")
             follower = None
+
+    # MotionExecutor および TachikomaOrchestrator のインスタンス化
+    motion_executor = MotionExecutor(follower_driver=follower)
+    orchestrator = TachikomaOrchestrator(motion_executor=motion_executor)
+
+    if args.test_ui:
+        print("=" * 70)
+        print("🧪 [TEST] interfaces/discord_bot.py UI・司令塔統合 単体テスト")
+        print("=" * 70)
+        embed = build_status_embed_sync()
+        print(f"1. 生成されたステータス Embed タイトル: {embed.title}")
+        print(f"   Embed 説明文字数: {len(embed.description)} chars")
+        print(f"   Embed フッター: {embed.footer.text}")
+
+        print("\n2. オーケストレーター経由の自然言語処理テスト:")
+        res = orchestrator.process_instruction("赤い木製ブロックを右奥に片付けて！")
+        print(f"   応答発話: {res['reply_text']}")
+        print(f"   サブタスク数: {len(res['tasks'])}")
+        print(f"   IK到達性: {res['ik_feasible']}")
+        print(f"   生成プレビューCSV: {res['preview_csvs']}")
+
+        print("\n" + "=" * 70)
+        print("🎉 discord_bot.py の統合単体テストが正常に完了しました！")
+        print("=" * 70)
+        return
 
     if not DISCORD_TOKEN:
         dlog("STARTUP", ".env に DISCORD_BOT_TOKEN が未設定のため Bot 接続はスキップします (テスト完了)。", "WARN")
