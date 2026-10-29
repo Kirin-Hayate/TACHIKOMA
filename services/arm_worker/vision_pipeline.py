@@ -266,14 +266,15 @@ if __name__ == "__main__":
     print("🧪 [TEST] services/arm_worker/vision_pipeline.py 単体動作検証")
     print("=" * 70)
 
-    # 動作確認のため VLM (Gemini) も有効にする場合は enable_vlm=True に変更可
-    pipeline = VisionPipeline(enable_vlm=False)
+    # 修正後: VLM (Gemini) を有効化
+    pipeline = VisionPipeline(enable_vlm=True)
 
     print("\n机上認識 ＆ ワールドステートJSON同期テスト:")
     success, state, msg = pipeline.scan_and_sync_world_state(
         image_path=args.image,
-        use_gemini=False
+        use_gemini=True
     )
+    
     print(f"実行結果: {msg}")
     print(f"成否: {success}")
     print(f"検出物体数: {state.get('total_objects')} 個")
