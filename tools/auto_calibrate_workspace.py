@@ -19,8 +19,11 @@ from config.joint_config import (
 # ドライバ層からインポート
 from drivers.sts3215 import STS3215Driver
 
-# コア層からインポート
-from core.sim_viewer import MujocoSimViewer
+# コア層からインポート (HeroBox 等の MuJoCo 非対応環境向けフォールバック)
+try:
+    from core.sim_viewer import MujocoSimViewer
+except (ImportError, ModuleNotFoundError, Exception):
+    MujocoSimViewer = None
 
 # arm_worker サービス層からインポート
 from services.arm_worker.kinematics import (
