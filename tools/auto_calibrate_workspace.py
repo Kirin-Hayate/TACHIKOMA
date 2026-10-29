@@ -16,16 +16,21 @@ from config.joint_config import (
     BAUDRATE,
     SERVO_IDS,
 )
-from core.sts3215 import STS3215Driver
+# ドライバ層からインポート
+from drivers.sts3215 import STS3215Driver
+
+# コア層からインポート
 from core.sim_viewer import MujocoSimViewer
-from core.kinematics import (
+
+# arm_worker サービス層からインポート
+from services.arm_worker.kinematics import (
     get_home_radians,
     solve_ik_adaptive_approach,
     raw_to_radian,
     radian_to_raw,
     GRIPPER_CLOSE_RAD
 )
-from core.square_workspace_solver import SquareWorkspaceSolver
+from services.arm_worker.square_workspace_solver import SquareWorkspaceSolver
 
 # 設定・出力パス
 JSON_CONFIG_PATH = os.path.join(BASE_DIR, "config", "markers_config.json")
