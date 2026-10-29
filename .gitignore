@@ -17,3 +17,27 @@ venv/
 # キャプチャデータ保存ディレクトリ全体を除外
 data/camera_captures/
 data/camera_captures/gemini_collage_input.jpg
+
+# ==============================================================================
+# TACHIKOMA 物理環境・プライバシー保護設定
+# ==============================================================================
+
+# 1. 机上物体認識ステート (リアルタイム更新されるためGit管理から除外)
+config/current_world_state.json
+
+# 2. カメラ撮影スナップショット・画像データ全般
+*.jpg
+*.jpeg
+*.png
+*.bmp
+*.mjpg
+
+# 3. テスト用画像・ログ保存フォルダ
+logs/
+data/test_*
+data/*.jpg
+data/*.png
+
+# 4. 一時ファイル (VisionPipelineのアトミック書き込み用一時ファイル等)
+tmp/
+*.tmp
