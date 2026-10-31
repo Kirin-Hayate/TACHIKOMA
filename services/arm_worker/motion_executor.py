@@ -378,14 +378,13 @@ class MotionExecutor:
                     )
 
                 # 実機サーボ書き込み
-                if self.is_connected:
-                    if not dry_run and self.is_connected():
-                        for target_rads, move_sec in seq_waypoints:
-                            if self.abort_flag:
-                                return False, "🛑 中断", saved_csv_path
-                            for sid in SERVO_IDS:
-                                self.follower.write_position(sid, radian_to_raw(sid, target_rads[sid]))
-                            time.sleep(move_sec)
+                if not dry_run and self.is_connected:
+                    for target_rads, move_sec in seq_waypoints:
+                        if self.abort_flag:
+                            return False, "🛑 中断", saved_csv_path
+                        for sid in SERVO_IDS:
+                            self.follower.write_position(sid, radian_to_raw(sid, target_rads[sid]))
+                        time.sleep(move_sec)
 
                 # 把持成否判定
                 is_grasped, grip_raw = self._check_grasp_success()
