@@ -226,6 +226,7 @@ def calculate_sag_compensation(r_m: float, theta_rad: float) -> float:
         + 45.5363 * (r_c * th_sq)
         + 36.2444
     )
+    delta_z_mm = max(0.0, min(20.0, delta_z_mm))
     return delta_z_mm / 1000.0
 
 

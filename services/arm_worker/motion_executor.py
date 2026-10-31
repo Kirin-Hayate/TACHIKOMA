@@ -244,7 +244,8 @@ class MotionExecutor:
         place_angle_deg: float = 0.0,
         reset_abort: bool = False,
         export_csv: bool = False,
-        csv_path: Optional[str] = None
+        csv_path: Optional[str] = None,
+        dry_run: bool = False  # 追加
     ) -> Tuple[bool, str, Optional[str]]:
         """
         単一物体の Pick & Place タスクを、把持空振り検知と 6段階リトライを交えて実行する。
@@ -378,12 +379,13 @@ class MotionExecutor:
 
                 # 実機サーボ書き込み
                 if self.is_real_connected:
-                    for target_rads, move_sec in seq_waypoints:
-                        if self.abort_flag:
-                            return False, "🛑 中断", saved_csv_path
-                        for sid in SERVO_IDS:
-                            self.follower.write_position(sid, radian_to_raw(sid, target_rads[sid]))
-                        time.sleep(move_sec)
+                    if not dry_run and self.is_connected():
+                        for target_rads, move_sec in seq_waypoints:
+                            if self.abort_flag:
+                                return False, "🛑 中断", saved_csv_path
+                            for sid in SERVO_IDS:
+                                self.follower.write_position(sid, radian_to_raw(sid, target_rads[sid]))
+                            time.sleep(move_sec)
 
                 # 把持成否判定
                 is_grasped, grip_raw = self._check_grasp_success()

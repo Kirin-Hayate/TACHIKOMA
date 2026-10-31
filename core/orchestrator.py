@@ -246,7 +246,7 @@ class TachikomaOrchestrator:
 
             # Pick IK 検証
             ik_grasp, ik_pick_wp, _ = solve_ik_tabletop_grasp(
-                x_phys_mm=x_mm, y_phys_mm=y_mm, z_phys_mm=2.0,
+                x_phys_mm=x_mm, y_phys_mm=y_mm, z_phys_mm=10.0,
                 angle_deg=angle_deg, obj_thickness_mm=minor_mm,
                 gripper_open_rad=GRIPPER_OPEN_RAD, enable_sag_compensation=True,
                 verbose=True  # kinematics側の詳細トレースをターミナルに展開
@@ -299,7 +299,8 @@ class TachikomaOrchestrator:
                 place_z_mm=pl_z_mm,
                 place_angle_deg=pl_roll_deg,
                 export_csv=True,
-                csv_path=csv_path
+                csv_path=csv_path,
+                dry_run=True
             )
             if saved_csv:
                 preview_csvs.append(saved_csv)
