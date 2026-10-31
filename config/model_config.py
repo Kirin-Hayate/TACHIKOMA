@@ -33,12 +33,9 @@ from typing import List
 # 2. 失敗時・レートリミット(429)時のフォールバック用標準 Flash
 # 3. バージョン固定のセーフティネット
 DEFAULT_CANDIDATE_MODELS: List[str] = [
-    "gemini-3.5-flash-lite",
-    "gemini-3.1-flash-lite",
-    "gemini-3.8-flash",
-    "gemini-flash-latest",
-    "gemini-3.8-flash",
-    "gemini-3.6-flash"
+    "gemini-3.5-flash-lite",  # 第1優先: RPD 500枠、最高速
+    "gemini-3.1-flash-lite",  # 第2優先: RPD 500枠、フォールバック用
+    "gemini-3.6-flash",
 ]
 
 # 単一モデル利用時（デフォルト推奨モデル）

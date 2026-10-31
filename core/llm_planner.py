@@ -182,84 +182,65 @@ class LLMTaskPlanner:
 
         last_error = None
         for model_idx, model_name in enumerate(self.candidate_models, start=1):
-            for attempt in range(2):
-                _log("GEMINI_CALL", f"[{model_idx}/{len(self.candidate_models)}] モデル '{model_name}' へ推論要求 (試行 {attempt + 1}/2)...", "STEP")
-                start_call = time.perf_counter()
+            _log("GEMINI_CALL", f"[{model_idx}/{len(self.candidate_models)}] モデル '{model_name}' へ推論要求...", "STEP")
+            start_call = time.perf_counter()
 
-                try:
-                    # GenerateContentConfig の呼び出し部分
-                    response = self.client.models.generate_content(
-                        model=model_name,
-                        contents=prompt,
-                        config=types.GenerateContentConfig(
-                            system_instruction=system_instruction,
-                            response_mime_type="application/json",
-                            temperature=0.2,
-                            # 👉 【追加】思考機能による無駄な長考をカット (即答させる)
-                            thinking_config=types.ThinkingConfig(thinking_budget=0)
-                        )
+            try:
+                # thinking_config を付与せず、クリーンに要求 (400 エラー対策)
+                response = self.client.models.generate_content(
+                    model=model_name,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        system_instruction=system_instruction,
+                        response_mime_type="application/json",
+                        temperature=0.2,
                     )
+                )
 
-                    elapsed_call = time.perf_counter() - start_call
-                    _log("GEMINI_CALL", f"API レスポンス取得成功 ({elapsed_call:.2f}秒) [モデル: {model_name}]", "OK")
+                elapsed_call = time.perf_counter() - start_call
+                _log("GEMINI_CALL", f"API レスポンス取得成功 ({elapsed_call:.2f}秒) [モデル: {model_name}]", "OK")
 
-                    raw_resp_text = response.text or "{}"
-                    _log("GEMINI_RAW", f"受信 JSON 生レスポンス:\n{raw_resp_text}", "DEBUG")
+                raw_resp_text = response.text or "{}"
+                plan_data = json.loads(raw_resp_text)
 
-                    plan_data = json.loads(raw_resp_text)
-                    if isinstance(plan_data, list):
-                        plan_data = {
-                            "thought": "シーケンス抽出完了",
-                            "reply_text": "了解いたしました！指示のシーケンスを実行いたしますね。",
-                            "tasks": plan_data
-                        }
+                if isinstance(plan_data, list):
+                    plan_data = {
+                        "thought": "シーケンス抽出完了",
+                        "reply_text": "了解いたしました！指示のシーケンスを実行いたしますね。",
+                        "tasks": plan_data
+                    }
 
-                    thought_log = plan_data.get("thought", "")
-                    reply_text_log = plan_data.get("reply_text", "")
-                    if thought_log:
-                        _log("LLM_THOUGHT", f"思考推論 (thought): {thought_log}", "INFO")
-                    _log("LLM_REPLY", f"発話生成 (reply_text): \"{reply_text_log}\"", "INFO")
+                thought_log = plan_data.get("thought", "")
+                reply_text_log = plan_data.get("reply_text", "")
+                if thought_log:
+                    _log("LLM_THOUGHT", f"思考推論: {thought_log}", "INFO")
+                _log("LLM_REPLY", f"発話生成: \"{reply_text_log}\"", "INFO")
 
-                    raw_tasks = plan_data.get("tasks") or []
-                    valid_tasks = []
+                raw_tasks = plan_data.get("tasks") or []
+                valid_tasks = []
 
-                    for t_idx, task in enumerate(raw_tasks, start=1):
-                        if task.get("type") == "pick_and_place" and "pick" in task and "place" in task:
-                            for key in ["pick", "place"]:
-                                coord = task[key]
-                                coord["r"] = float(max(R_MIN_METERS, min(R_MAX_METERS, coord.get("r", 0.25))))
-                                coord["theta_deg"] = float(max(-90.0, min(90.0, coord.get("theta_deg", 0.0))))
-                                coord["z"] = float(max(0.005, min(0.120, coord.get("z", DEFAULT_Z_TCP))))
-                            valid_tasks.append(task)
+                for t_idx, task in enumerate(raw_tasks, start=1):
+                    if task.get("type") == "pick_and_place" and "pick" in task and "place" in task:
+                        for key in ["pick", "place"]:
+                            coord = task[key]
+                            coord["r"] = float(max(R_MIN_METERS, min(R_MAX_METERS, coord.get("r", 0.25))))
+                            coord["theta_deg"] = float(max(-90.0, min(90.0, coord.get("theta_deg", 0.0))))
+                            coord["z"] = float(max(0.005, min(0.120, coord.get("z", DEFAULT_Z_TCP))))
+                        valid_tasks.append(task)
+                        _log("LLM_TASK", f"  タスク {t_idx}: Target ID={task.get('target_id')} | {task.get('description')}", "DEBUG")
 
-                            pk = task["pick"]
-                            pl = task["place"]
-                            _log("LLM_TASK", f"  タスク {t_idx}: Target ID={task.get('target_id')} | {task.get('description')}", "DEBUG")
-                            _log("LLM_TASK", f"    ├ Pick : r={pk['r']:.3f}m, θ={pk['theta_deg']:+.1f}°, z={pk['z']:.3f}m", "DEBUG")
-                            _log("LLM_TASK", f"    └ Place: r={pl['r']:.3f}m, θ={pl['theta_deg']:+.1f}°, z={pl['z']:.3f}m", "DEBUG")
-                        else:
-                            _log("LLM_TASK", f"  タスク {t_idx}: 形式不適合のため除外 -> {task}", "WARN")
+                plan_data["tasks"] = valid_tasks
+                self.model_name = model_name
+                _log("LLM_PLAN", f"タスク推論完了: 有効タスク数={len(valid_tasks)}件 (採択モデル: {model_name})", "OK")
+                return plan_data
 
-                    plan_data["tasks"] = valid_tasks
-                    self.model_name = model_name
-                    _log("LLM_PLAN", f"タスク推論完了: 有効タスク数={len(valid_tasks)}件 (採択モデル: {model_name})", "OK")
-                    return plan_data
-
-                except Exception as e:
-                    elapsed_call = time.perf_counter() - start_call
-                    last_error = e
-                    err_msg = str(e)
-                    _log("GEMINI_CALL", f"モデル '{model_name}' 試行 {attempt + 1} 失敗 ({elapsed_call:.2f}秒): {err_msg}", "ERR")
-
-                    if "404" in err_msg or "NOT_FOUND" in err_msg:
-                        _log("GEMINI_FAILOVER", f"モデル '{model_name}' は利用不可 (404/NotFound)。次のモデル候補へ即時移行します。", "WARN")
-                        break
-                    if attempt == 0 and ("503" in err_msg or "UNAVAILABLE" in err_msg):
-                        _log("GEMINI_FAILOVER", "一時的な高負荷 (503/Busy) を検知。1秒待機後に再試行します...", "WARN")
-                        time.sleep(1.0)
-                    else:
-                        _log("GEMINI_FAILOVER", f"モデル '{model_name}' の試行上限。次のモデル候補へ移行します。", "WARN")
-                        break
+            except Exception as e:
+                elapsed_call = time.perf_counter() - start_call
+                last_error = e
+                err_msg = str(e)
+                _log("GEMINI_CALL", f"モデル '{model_name}' 失敗 ({elapsed_call:.2f}秒): {err_msg}", "ERR")
+                _log("GEMINI_FAILOVER", f"待機せず即座に次のモデル候補へ移行します。", "WARN")
+                continue
 
         if last_error:
             _log("LLM_PLAN", "全候補モデルでの推論試行に失敗しました。スタックトレースを出力します:", "ERR")
