@@ -121,7 +121,7 @@ class MotionExecutor:
         self.abort_flag = False
 
     @property
-    def is_real_connected(self) -> bool:
+    def is_connected(self) -> bool:
         if self.follower is None:
             return False
         if hasattr(self.follower, "ser") and self.follower.ser is not None:
