@@ -210,7 +210,7 @@ class SystemControlView(View):
         jpeg_bytes, snap_err = await asyncio.to_thread(orchestrator.vision.capture_annotated_snapshot)
         
         # 2. 机上認識・ワールドステート更新 (ArUcoマーカーがあれば更新)
-        success, new_state, msg = await asyncio.to_thread(orchestrator.refresh_vision, None, False)
+        success, new_state, msg = await asyncio.to_thread(orchestrator.refresh_vision, None, True)
         obj_count = new_state.get("total_objects", 0)
         updated_at = new_state.get("updated_at", "不明")
 
@@ -473,7 +473,7 @@ async def on_message(message: discord.Message):
                 if orchestrator is None:
                     await message.reply("⚠️ オーケストレーターが初期化されていません。")
                     return
-                success, new_state, scan_msg = await asyncio.to_thread(orchestrator.refresh_vision, None, False)
+                success, new_state, scan_msg = await asyncio.to_thread(orchestrator.refresh_vision, None, True)
                 await message.reply(f"📸 **机上スキャン完了**: {scan_msg} (物体数: `{new_state.get('total_objects', 0)}`)")
             return
 
