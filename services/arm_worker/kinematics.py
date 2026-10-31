@@ -354,10 +354,10 @@ def solve_ik_wrist_and_pitch(
                     return (None, msg) if return_reason else None
         
         # ⚠️ 【追加】自己干渉防止: 肩関節 (ID 2) が後ろに倒れ込みすぎる姿勢 (Raw < 1350) を除外
-        raw_id2 = radian_to_raw(2, rad_targets[2])
-        if raw_id2 < 1350:
-            msg = f"自己干渉リスク (肩ID2が後方反りすぎ: Raw={raw_id2} < 1350)"
-            return (None, msg) if return_reason else None
+        #raw_id2 = radian_to_raw(2, rad_targets[2])
+        #if raw_id2 < 1350:
+        #    msg = f"自己干渉リスク (肩ID2が後方反りすぎ: Raw={raw_id2} < 1350)"
+        #    return (None, msg) if return_reason else None
 
         return (rad_targets, "OK") if return_reason else rad_targets
 
