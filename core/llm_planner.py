@@ -46,6 +46,21 @@ from config.workspace_config import (
 WORLD_STATE_PATH = os.path.join(BASE_DIR, "config", "current_world_state.json")
 
 
+def _log(tag: str, msg: str, level: str = "INFO"):
+    """ターミナル向け詳細ログ出力関数"""
+    symbols = {
+        "INFO": "ℹ️",
+        "OK": "✅",
+        "WARN": "⚠️",
+        "ERR": "❌",
+        "DEBUG": "🔍",
+        "STEP": "🚀",
+    }
+    sym = symbols.get(level, "•")
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{ts}] {sym} [{tag}] {msg}", flush=True)
+
+
 class LLMTaskPlanner:
     def __init__(
         self,
@@ -54,6 +69,7 @@ class LLMTaskPlanner:
     ):
         self.api_key = api_key or os.getenv("GEMINI_API_KEY")
         if not self.api_key:
+            _log("LLM_INIT", "GEMINI_API_KEY が見つかりません。.env を確認してください。", "ERR")
             raise ValueError("❌ GEMINI_API_KEY が見つかりません。.env を確認してください。")
         
         # 👇 【追加・変更】SDK内部の自動リトライを無効化(attempts=1)し、15秒でタイムアウトさせる
@@ -83,18 +99,27 @@ class LLMTaskPlanner:
         else:
             self.candidate_models = candidate_models
 
+        # 現在利用可能な先頭モデルを保持 (オーケストレーター参照用)
+        self.model_name = self.candidate_models[0] if self.candidate_models else "Gemini"
+        _log("LLM_INIT", f"LLMTaskPlanner 初期化完了 (候補モデル: {self.candidate_models})", "OK")
+
     def _load_current_world_state(self) -> Dict[str, Any]:
         if os.path.exists(WORLD_STATE_PATH):
             try:
                 with open(WORLD_STATE_PATH, "r", encoding="utf-8") as f:
-                    return json.load(f)
+                    data = json.load(f)
+                    _log("WORLD_STATE", f"ワールドステート読込成功 (登録物体数: {data.get('total_objects', len(data.get('objects', [])))}個)", "DEBUG")
+                    return data
             except Exception as e:
+                _log("WORLD_STATE", f"ワールドステート読み込み失敗: {e}", "WARN")
                 print(f"⚠️ ワールドステート読み込み失敗: {e}")
         return {"total_objects": 0, "objects": [], "workspace": {"place_area_xy_mm": [180.0, 160.0]}}
 
     def plan(self, user_instruction: str, world_state: Optional[Dict[str, Any]] = None) -> dict:
         if world_state is None:
             world_state = self._load_current_world_state()
+
+        _log("LLM_PLAN", f"タスク推論開始: 指示='{user_instruction}'", "STEP")
 
         system_instruction = (
             "あなたの名前はお手伝いロボット『TACHIKOMA（タチコマ）』です。\n"
@@ -156,8 +181,11 @@ class LLMTaskPlanner:
 """
 
         last_error = None
-        for model_name in self.candidate_models:
+        for model_idx, model_name in enumerate(self.candidate_models, start=1):
             for attempt in range(2):
+                _log("GEMINI_CALL", f"[{model_idx}/{len(self.candidate_models)}] モデル '{model_name}' へ推論要求 (試行 {attempt + 1}/2)...", "STEP")
+                start_call = time.perf_counter()
+
                 try:
                     # GenerateContentConfig の呼び出し部分
                     response = self.client.models.generate_content(
@@ -172,7 +200,13 @@ class LLMTaskPlanner:
                         )
                     )
 
-                    plan_data = json.loads(response.text)
+                    elapsed_call = time.perf_counter() - start_call
+                    _log("GEMINI_CALL", f"API レスポンス取得成功 ({elapsed_call:.2f}秒) [モデル: {model_name}]", "OK")
+
+                    raw_resp_text = response.text or "{}"
+                    _log("GEMINI_RAW", f"受信 JSON 生レスポンス:\n{raw_resp_text}", "DEBUG")
+
+                    plan_data = json.loads(raw_resp_text)
                     if isinstance(plan_data, list):
                         plan_data = {
                             "thought": "シーケンス抽出完了",
@@ -180,10 +214,16 @@ class LLMTaskPlanner:
                             "tasks": plan_data
                         }
 
+                    thought_log = plan_data.get("thought", "")
+                    reply_text_log = plan_data.get("reply_text", "")
+                    if thought_log:
+                        _log("LLM_THOUGHT", f"思考推論 (thought): {thought_log}", "INFO")
+                    _log("LLM_REPLY", f"発話生成 (reply_text): \"{reply_text_log}\"", "INFO")
+
                     raw_tasks = plan_data.get("tasks") or []
                     valid_tasks = []
 
-                    for task in raw_tasks:
+                    for t_idx, task in enumerate(raw_tasks, start=1):
                         if task.get("type") == "pick_and_place" and "pick" in task and "place" in task:
                             for key in ["pick", "place"]:
                                 coord = task[key]
@@ -192,21 +232,39 @@ class LLMTaskPlanner:
                                 coord["z"] = float(max(0.005, min(0.120, coord.get("z", DEFAULT_Z_TCP))))
                             valid_tasks.append(task)
 
+                            pk = task["pick"]
+                            pl = task["place"]
+                            _log("LLM_TASK", f"  タスク {t_idx}: Target ID={task.get('target_id')} | {task.get('description')}", "DEBUG")
+                            _log("LLM_TASK", f"    ├ Pick : r={pk['r']:.3f}m, θ={pk['theta_deg']:+.1f}°, z={pk['z']:.3f}m", "DEBUG")
+                            _log("LLM_TASK", f"    └ Place: r={pl['r']:.3f}m, θ={pl['theta_deg']:+.1f}°, z={pl['z']:.3f}m", "DEBUG")
+                        else:
+                            _log("LLM_TASK", f"  タスク {t_idx}: 形式不適合のため除外 -> {task}", "WARN")
+
                     plan_data["tasks"] = valid_tasks
+                    self.model_name = model_name
+                    _log("LLM_PLAN", f"タスク推論完了: 有効タスク数={len(valid_tasks)}件 (採択モデル: {model_name})", "OK")
                     return plan_data
 
                 except Exception as e:
+                    elapsed_call = time.perf_counter() - start_call
                     last_error = e
                     err_msg = str(e)
+                    _log("GEMINI_CALL", f"モデル '{model_name}' 試行 {attempt + 1} 失敗 ({elapsed_call:.2f}秒): {err_msg}", "ERR")
+
                     if "404" in err_msg or "NOT_FOUND" in err_msg:
+                        _log("GEMINI_FAILOVER", f"モデル '{model_name}' は利用不可 (404/NotFound)。次のモデル候補へ即時移行します。", "WARN")
                         break
                     if attempt == 0 and ("503" in err_msg or "UNAVAILABLE" in err_msg):
+                        _log("GEMINI_FAILOVER", "一時的な高負荷 (503/Busy) を検知。1秒待機後に再試行します...", "WARN")
                         time.sleep(1.0)
                     else:
+                        _log("GEMINI_FAILOVER", f"モデル '{model_name}' の試行上限。次のモデル候補へ移行します。", "WARN")
                         break
 
         if last_error:
+            _log("LLM_PLAN", "全候補モデルでの推論試行に失敗しました。スタックトレースを出力します:", "ERR")
             traceback.print_exc()
+
         return {
             "thought": "全候補モデルでの推論試行に失敗しました。",
             "reply_text": "通信エラーが発生したようです……もう一度指示をいただけますでしょうか！",

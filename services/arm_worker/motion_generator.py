@@ -27,7 +27,7 @@ if BASE_DIR not in sys.path:
     sys.path.append(BASE_DIR)
 
 from config.joint_config import SERVO_IDS, SAMPLING_RATE_HZ
-from core.kinematics import (
+from services.arm_worker.kinematics import (
     get_home_radians,
     solve_ik_adaptive_approach,
     GRIPPER_OPEN_RAD,

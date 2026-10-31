@@ -1,4 +1,4 @@
-"""
+﻿"""
 ==============================================================================
 TACHIKOMA 角度変換・運動学・自重たわみ補正・非対称把持モジュール (core/kinematics.py)
 ==============================================================================
@@ -338,7 +338,7 @@ def solve_ik_wrist_and_pitch(
             r_wrist, theta_deg, z_wrist, target_pitch_deg, wrist_roll_rad, gripper_rad
         )
         if rad_targets is None:
-            msg = "幾何学到達限界外"
+            msg = f"幾何学到達限界外 (手首到達距離: r={r_wrist*1000:.1f}mm, z={z_wrist*1000:.1f}mm)"
             return (None, msg) if return_reason else None
 
         # サーボ可動域リミットチェック (ID 1〜5)
@@ -347,7 +347,9 @@ def solve_ik_wrist_and_pitch(
             if cfg and cfg["type"] == "bounded":
                 raw_val = radian_to_raw(sid, rad_targets[sid])
                 if not (cfg["f_min"] <= raw_val <= cfg["f_max"]):
-                    msg = f"サーボ ID{sid} 可動域外 (Raw={raw_val}, 許容: {cfg['f_min']}〜{cfg['f_max']})"
+                    diff = raw_val - cfg["f_max"] if raw_val > cfg["f_max"] else cfg["f_min"] - raw_val
+                    bound_type = "上限超過" if raw_val > cfg["f_max"] else "下限未満"
+                    msg = f"サーボ ID{sid} 可動域外 ({bound_type} +{diff}ステップ: Raw={raw_val}, 許容: {cfg['f_min']}〜{cfg['f_max']})"
                     return (None, msg) if return_reason else None
 
         return (rad_targets, "OK") if return_reason else rad_targets
@@ -420,7 +422,9 @@ def solve_ik_wrist_and_pitch(
         if cfg and cfg["type"] == "bounded":
             raw_val = radian_to_raw(sid, rad_targets[sid])
             if not (cfg["f_min"] <= raw_val <= cfg["f_max"]):
-                msg = f"サーボ ID{sid} 可動域外 (Raw={raw_val}, 許容: {cfg['f_min']}〜{cfg['f_max']})"
+                diff = raw_val - cfg["f_max"] if raw_val > cfg["f_max"] else cfg["f_min"] - raw_val
+                bound_type = "上限超過" if raw_val > cfg["f_max"] else "下限未満"
+                msg = f"サーボ ID{sid} 可動域外 ({bound_type} +{diff}ステップ: Raw={raw_val}, 許容: {cfg['f_min']}〜{cfg['f_max']})"
                 return (None, msg) if return_reason else None
 
     return (rad_targets, "OK") if return_reason else rad_targets
@@ -496,18 +500,19 @@ def solve_ik_tabletop_grasp(
     theta_deg = math.degrees(math.atan2(p_tcp[1], p_tcp[0]))
     corr_z_m = z_phys_mm / 1000.0
 
-    if verbose:
-        print("   [把持幾何計算 (可動域拡張モード)]")
-        print(f"      物体中心       : ({p_obj[0]*1000:.1f}, {p_obj[1]*1000:.1f}) mm")
-        print(f"      到達半径 r_tcp : {r_tcp*1000:.1f} mm (上限: {MAX_REACH_M*1000:.0f} mm)")
-        print(f"      目標 TCP       : ({p_tcp[0]*1000:.1f}, {p_tcp[1]*1000:.1f}) mm | 手首ロール: {chosen_rel_roll:.1f}°")
-
-    # 6. 自重たわみ補正
+    sag_offset_mm = 0.0
     if enable_sag_compensation:
         sag_offset = calculate_sag_compensation(r_tcp, math.radians(theta_deg))
         effective_z = corr_z_m + sag_offset
+        sag_offset_mm = sag_offset * 1000.0
     else:
         effective_z = corr_z_m
+
+    if verbose:
+        print("   [把持幾何計算 (可動域拡張モード)]")
+        print(f"      物体中心       : ({p_obj[0]*1000:.1f}, {p_obj[1]*1000:.1f}) mm | 入力Z: {z_phys_mm:.1f} mm")
+        print(f"      到達半径 r_tcp : {r_tcp*1000:.1f} mm (上限: {MAX_REACH_M*1000:.0f} mm) | たわみ補正: +{sag_offset_mm:.1f} mm (実効Z: {effective_z*1000:.1f} mm)")
+        print(f"      目標 TCP       : ({p_tcp[0]*1000:.1f}, {p_tcp[1]*1000:.1f}) mm | 手首ロール: {chosen_rel_roll:.1f}°")
 
     # 7. ピッチ角探索ループ (浅い進入角 10°, 5° を含む)
     candidate_pitches = [80.0, 60.0, 40.0, 20.0, 10.0, 5.0]
@@ -551,10 +556,14 @@ def solve_ik_tabletop_grasp(
             failure_logs.append(f"ピッチ {pitch_deg:4.1f}° [上空点NG]: {reason_wp}")
             continue
 
+        if verbose:
+            raw_tgt = {sid: radian_to_raw(sid, ik_target[sid]) for sid in SERVO_IDS}
+            print(f"   ✅ [把持 IK 探索成功] 選択ピッチ: {pitch_deg:.1f}° | Raw目標値: {raw_tgt}")
+
         return ik_target, ik_wp, float(pitch_deg)
 
     if verbose:
-        print("   🔍 【IK 探索失敗トレース】:")
+        print("   🔍 【把持 IK 探索失敗トレース】:")
         for log in failure_logs:
             print(f"      ✖ {log}")
 
@@ -628,7 +637,7 @@ def solve_ik_adaptive_approach(
 
 
 # ==============================================================================
-# 6. 配置 (Place) 専用 IK 計算レイヤー
+# 6. 配置 (Place) 専用 IK 計算レイヤー (詳細ログ強化版)
 # ==============================================================================
 def solve_ik_tabletop_place(
     x_phys_mm: float,
@@ -659,13 +668,22 @@ def solve_ik_tabletop_place(
     wrist_roll_rad = math.radians(chosen_rel_roll)
 
     corr_z_m = z_phys_mm / 1000.0
+    sag_offset_mm = 0.0
     if enable_sag_compensation:
         sag_offset = calculate_sag_compensation(r_place, base_theta_rad)
         effective_z = corr_z_m + sag_offset
+        sag_offset_mm = sag_offset * 1000.0
     else:
         effective_z = corr_z_m
 
+    if verbose:
+        print("   [配置幾何計算 (Place 計画)]")
+        print(f"      目標座標       : ({x_phys_mm:.1f}, {y_phys_mm:.1f}) mm | 入力Z: {z_phys_mm:.1f} mm")
+        print(f"      到達半径 r     : {r_place*1000:.1f} mm | 旋回角 θ: {base_theta_deg:.1f}°")
+        print(f"      たわみ補正     : +{sag_offset_mm:.1f} mm (実効Z: {effective_z*1000:.1f} mm) | 手首ロール: {chosen_rel_roll:.1f}°")
+
     candidate_pitches = [80.0, 60.0, 40.0, 20.0, 10.0]
+    failure_logs = []
 
     for pitch_deg in candidate_pitches:
         pitch_rad = math.radians(pitch_deg)
@@ -673,7 +691,7 @@ def solve_ik_tabletop_place(
         z_wrist_target = effective_z + L_GRIPPER * math.sin(pitch_rad)
 
         # 接地目標点 (爪は閉じたまま降下)
-        ik_target, _ = solve_ik_wrist_and_pitch(
+        ik_target, reason_target = solve_ik_wrist_and_pitch(
             r_wrist=r_wrist_target,
             theta_deg=base_theta_deg,
             z_wrist=z_wrist_target,
@@ -683,6 +701,7 @@ def solve_ik_tabletop_place(
             return_reason=True
         )
         if ik_target is None:
+            failure_logs.append(f"ピッチ {pitch_deg:4.1f}° [配置接地NG]: {reason_target}")
             continue
 
         # 上空進入点
@@ -690,7 +709,7 @@ def solve_ik_tabletop_place(
         r_wrist_wp = r_wrist_target
         z_wrist_wp = z_wrist_target + DELTA_Z_WRIST_WP
 
-        ik_wp, _ = solve_ik_wrist_and_pitch(
+        ik_wp, reason_wp = solve_ik_wrist_and_pitch(
             r_wrist=r_wrist_wp,
             theta_deg=base_theta_deg,
             z_wrist=z_wrist_wp,
@@ -701,11 +720,18 @@ def solve_ik_tabletop_place(
             return_reason=True
         )
         if ik_wp is None:
+            failure_logs.append(f"ピッチ {pitch_deg:4.1f}° [配置上空NG]: {reason_wp}")
             continue
 
         if verbose:
-            print(f"   [Place 計画成立] 目標: ({x_phys_mm:.1f}, {y_phys_mm:.1f}, {z_phys_mm:.1f}) mm | ピッチ: {pitch_deg:.1f}°")
+            raw_tgt = {sid: radian_to_raw(sid, ik_target[sid]) for sid in SERVO_IDS}
+            print(f"   ✅ [Place 計画成立] 選択ピッチ: {pitch_deg:.1f}° | Raw目標値: {raw_tgt}")
 
         return ik_target, ik_wp, float(pitch_deg)
+
+    if verbose:
+        print("   🔍 【Place IK 探索失敗トレース】:")
+        for log in failure_logs:
+            print(f"      ✖ {log}")
 
     return None, None, None
