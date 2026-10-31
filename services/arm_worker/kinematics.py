@@ -352,6 +352,12 @@ def solve_ik_wrist_and_pitch(
                     bound_type = "上限超過" if raw_val > cfg["f_max"] else "下限未満"
                     msg = f"サーボ ID{sid} 可動域外 ({bound_type} +{diff}ステップ: Raw={raw_val}, 許容: {cfg['f_min']}〜{cfg['f_max']})"
                     return (None, msg) if return_reason else None
+        
+        # ⚠️ 【追加】自己干渉防止: 肩関節 (ID 2) が後ろに倒れ込みすぎる姿勢 (Raw < 1350) を除外
+        raw_id2 = radian_to_raw(2, rad_targets[2])
+        if raw_id2 < 1350:
+            msg = f"自己干渉リスク (肩ID2が後方反りすぎ: Raw={raw_id2} < 1350)"
+            return (None, msg) if return_reason else None
 
         return (rad_targets, "OK") if return_reason else rad_targets
 
@@ -516,7 +522,8 @@ def solve_ik_tabletop_grasp(
         print(f"      目標 TCP       : ({p_tcp[0]*1000:.1f}, {p_tcp[1]*1000:.1f}) mm | 手首ロール: {chosen_rel_roll:.1f}°")
 
     # 7. ピッチ角探索ループ (浅い進入角 10°, 5° を含む)
-    candidate_pitches = [80.0, 60.0, 40.0, 20.0, 10.0, 5.0]
+    # --- 修正後: 自己干渉を防ぐ安定角を最優先 ---
+    candidate_pitches = [30.0, 40.0, 20.0, 50.0, 10.0]
     failure_logs = []
 
     for pitch_deg in candidate_pitches:
@@ -594,7 +601,7 @@ def solve_ik_adaptive_approach(
     else:
         effective_z = z_tcp
 
-    candidate_pitches = [80.0, 60.0, 40.0, 20.0]
+    candidate_pitches = [30.0, 40.0, 20.0, 50.0, 10.0]
 
     for pitch_deg in candidate_pitches:
         pitch_rad = math.radians(pitch_deg)
@@ -683,7 +690,8 @@ def solve_ik_tabletop_place(
         print(f"      到達半径 r     : {r_place*1000:.1f} mm | 旋回角 θ: {base_theta_deg:.1f}°")
         print(f"      たわみ補正     : +{sag_offset_mm:.1f} mm (実効Z: {effective_z*1000:.1f} mm) | 手首ロール: {chosen_rel_roll:.1f}°")
 
-    candidate_pitches = [80.0, 60.0, 40.0, 20.0, 10.0]
+    # --- 修正後: 自然に前方に突き出して置く角度を優先 ---
+    candidate_pitches = [30.0, 40.0, 20.0, 50.0, 10.0]
     failure_logs = []
 
     for pitch_deg in candidate_pitches:

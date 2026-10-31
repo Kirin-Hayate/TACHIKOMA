@@ -377,6 +377,9 @@ class MotionExecutor:
                         prefix=f"task_{safe_name}"
                     )
 
+                    if dry_run:
+                        return True, "✅ プレビュー用CSVを生成しました (事前検証OK)", saved_csv_path
+
                 # 実機サーボ書き込み
                 if not dry_run and self.is_connected:
                     for target_rads, move_sec in seq_waypoints:
