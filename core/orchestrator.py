@@ -401,7 +401,7 @@ if __name__ == "__main__":
                 }
             }
         ],
-        "workspace": {"place_area_xy_mm": [180.0, -120.0]}
+        "workspace": {"place_area_xy_mm": [230.0, 160.0]}
     }
     with open(WORLD_STATE_PATH, "w", encoding="utf-8") as f:
         json.dump(mock_test_state, f, ensure_ascii=False, indent=2)
