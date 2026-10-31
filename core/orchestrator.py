@@ -218,9 +218,11 @@ class TachikomaOrchestrator:
             pl_x_mm = pl_r_mm * math.cos(pl_th_rad)
             pl_y_mm = pl_r_mm * math.sin(pl_th_rad)
 
-            # Place IK 検証
+            # Place IK 検証 (机上リリース高度として最低 15.0mm を確保)
+            safe_pl_z_mm = max(15.0, float(pl_z_mm))
+
             ik_place_tgt, ik_place_wp, _ = solve_ik_tabletop_place(
-                x_phys_mm=pl_x_mm, y_phys_mm=pl_y_mm, z_phys_mm=pl_z_mm,
+                x_phys_mm=pl_x_mm, y_phys_mm=pl_y_mm, z_phys_mm=safe_pl_z_mm,
                 place_angle_deg=pl_roll_deg, enable_sag_compensation=True,
                 verbose=False
             )
