@@ -133,14 +133,14 @@ class MotionExecutor:
     def trigger_abort(self):
         """緊急停止フラグを立て、即座に全サーボを脱力させる"""
         self.abort_flag = True
-        if self.is_real_connected:
+        if self.is_connected:
             emergency_stop_arm(self.follower)
 
     def _check_grasp_success(self) -> Tuple[bool, int]:
         """
         グリッパー (ID 6) の現在 Raw 値を読み取り、把持成否を判定する。
         """
-        if not self.is_real_connected:
+        if not self.is_connected:
             return True, 1750
 
         grip_raw = None
@@ -271,7 +271,7 @@ class MotionExecutor:
 
         print(f"\n🚀 [MotionExecutor] タスク開始: '{display_name}' ➔ 目標 ({place_x_mm:+.1f}, {place_y_mm:+.1f}, Z:{place_z_mm:.1f}mm)")
 
-        if self.is_real_connected:
+        if self.is_connected:
             for sid in SERVO_IDS:
                 try:
                     self.follower.set_torque(sid, True)
@@ -378,7 +378,7 @@ class MotionExecutor:
                     )
 
                 # 実機サーボ書き込み
-                if self.is_real_connected:
+                if self.is_connected:
                     if not dry_run and self.is_connected():
                         for target_rads, move_sec in seq_waypoints:
                             if self.abort_flag:
@@ -402,7 +402,7 @@ class MotionExecutor:
         except Exception as e:
             return False, f"❌ 物理搬送中に例外が発生しました: {e}", saved_csv_path
         finally:
-            if self.is_real_connected:
+            if self.is_connected:
                 emergency_stop_arm(self.follower)
 
     def execute_plan_sequence(
