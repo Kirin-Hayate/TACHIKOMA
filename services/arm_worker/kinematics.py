@@ -99,7 +99,7 @@ JAW_LOCAL_TCP_OFFSET = np.array([0.0, -0.045, 0.0])
 
 # 幾何定数 [m]
 L_GRIPPER = 0.160            # 手首ピッチ回転軸から爪先端把持点までの実効長 (160mm)
-DELTA_Z_WRIST_WP = 0.050     # 把持点に対する上空アプローチ待機点の垂直マージン (+50mm)
+DELTA_Z_WRIST_WP = 0.035     # 把持点に対する上空アプローチ待機点の垂直マージン (+50mm)
 DEFAULT_APPROACH_DEG = 90.0  # デフォルト進入角 (90°: 真上からの垂直降下)
 MIN_APPROACH_DEG = 5.0       # 許容する最小進入角 (5°: 斜めアプローチ限界)
 

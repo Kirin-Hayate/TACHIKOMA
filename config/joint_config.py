@@ -90,7 +90,7 @@ JOINT_CONFIG = {
     4: {
         "type": "bounded",
         "r_min": 1650, "r_max": 4015,        "r_cross": False,
-        "f_min": 735,  "f_max": 3450,        "f_cross": False,
+        "f_min": 735,  "f_max": 3650,        "f_cross": False,
         "init": 735,   # 内側折りたたみ初期位置
     },
 
