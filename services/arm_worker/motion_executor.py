@@ -1,4 +1,4 @@
-"""
+﻿"""
 ==============================================================================
 TACHIKOMA 物理搬送実行 ＆ 自律リトライ制御モジュール (services/arm_worker/motion_executor.py)
 ==============================================================================
@@ -122,8 +122,13 @@ class MotionExecutor:
 
     @property
     def is_real_connected(self) -> bool:
-        """実機アームと正常にシリアル通信可能かどうか"""
-        return self.follower is not None and getattr(self.follower, "is_open", False)
+        if self.follower is None:
+            return False
+        if hasattr(self.follower, "ser") and self.follower.ser is not None:
+            return getattr(self.follower.ser, "is_open", True)
+        if hasattr(self.follower, "serial") and self.follower.serial is not None:
+            return getattr(self.follower.serial, "is_open", True)
+        return getattr(self.follower, "is_open", True)
 
     def trigger_abort(self):
         """緊急停止フラグを立て、即座に全サーボを脱力させる"""

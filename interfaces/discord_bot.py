@@ -1,4 +1,4 @@
-"""
+﻿"""
 ==============================================================================
 TACHIKOMA Discord Bridge (interfaces/discord_bot.py) [Orchestrator統合版]
 ==============================================================================
@@ -50,7 +50,7 @@ if BASE_DIR not in sys.path:
 
 load_dotenv(os.path.join(BASE_DIR, ".env"))
 
-# --- 内部モジュール (新アーキテクチャ連携) ---
+# --- 内部モジュール (新アーキテクチャ連携: 参照関係を完全維持) ---
 from config.model_config import get_candidate_models, get_primary_model
 from services.sentinel.system_actions import (
     emergency_stop_arm,
@@ -66,7 +66,7 @@ from services.sentinel.system_monitor import (
     ALERT_COOLDOWN_SEC,
 )
 
-# --- 司令塔・Worker モジュール ---
+# --- 司令塔・Worker モジュール (参照関係を完全維持) ---
 from core.orchestrator import TachikomaOrchestrator
 from services.arm_worker.motion_executor import MotionExecutor
 
@@ -85,7 +85,14 @@ except ImportError:
 # ==============================================================================
 def dlog(tag: str, msg: str, level: str = "INFO"):
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-    prefix_map = {"INFO": "ℹ️", "OK": "✅", "WARN": "⚠️", "ERR": "❌", "DEBUG": "🔍"}
+    prefix_map = {
+        "INFO": "ℹ️",
+        "OK": "✅",
+        "WARN": "⚠️",
+        "ERR": "❌",
+        "DEBUG": "🔍",
+        "STEP": "🚀",
+    }
     icon = prefix_map.get(level.upper(), "•")
     print(f"[{now}] {icon} [{tag}] {msg}", flush=True)
 
@@ -95,6 +102,7 @@ def derr(tag: str, context_msg: str, exc: Exception = None):
     print(f"[{now}] ❌ [ERROR in {tag}] {context_msg}", flush=True)
     if exc is not None:
         print(f"Detail: {exc}", flush=True)
+        traceback.print_exc()
 
 
 # ==============================================================================
@@ -128,7 +136,16 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 def get_connected_hardware_list() -> List[str]:
     hw_items = []
     # (1) アーム接続確認
-    if follower is not None and getattr(follower, "is_open", False):
+    is_arm_open = False
+    if follower is not None:
+        if hasattr(follower, "ser") and follower.ser is not None:
+            is_arm_open = getattr(follower.ser, "is_open", True)
+        elif hasattr(follower, "serial") and follower.serial is not None:
+            is_arm_open = getattr(follower.serial, "is_open", True)
+        else:
+            is_arm_open = getattr(follower, "is_open", True)
+
+    if is_arm_open:
         hw_items.append(f"🦾 **アーム**: 接続中・通信可能 (`{FOLLOWER_PORT}`)")
     elif os.path.exists(FOLLOWER_PORT):
         hw_items.append(f"🦾 **アーム**: ポート認識済・未オープン (`{FOLLOWER_PORT}`)")
@@ -200,19 +217,24 @@ class SystemControlView(View):
 
     @discord.ui.button(label="📸 撮影/再スキャン", style=discord.ButtonStyle.secondary, custom_id="sys_cam_snap", row=0)
     async def snap_camera(self, interaction: discord.Interaction, button: Button):
-        dlog("UI_BTN", f"[📸 撮影/再スキャン] 押下 (User: {interaction.user})", "INFO")
+        dlog("UI_BTN", f"[📸 撮影/再スキャン] 押下 (ユーザー: {interaction.user})", "STEP")
         await interaction.response.defer()
         if orchestrator is None:
+            dlog("UI_BTN", "オーケストレーター未初期化のため中断", "WARN")
             await interaction.followup.send("⚠️ オーケストレーターが初期化されていません。")
             return
 
+        start_t = time.perf_counter()
         # 1. カメラ画像 (生フレーム or マーカー注釈付き) を取得
         jpeg_bytes, snap_err = await asyncio.to_thread(orchestrator.vision.capture_annotated_snapshot)
         
-        # 2. 机上認識・ワールドステート更新 (ArUcoマーカーがあれば更新)
+        # 2. 机上認識・ワールドステート更新 (ArUcoマーカー + Gemini VLM 同定)
         success, new_state, msg = await asyncio.to_thread(orchestrator.refresh_vision, None, True)
+        elapsed = time.perf_counter() - start_t
+
         obj_count = new_state.get("total_objects", 0)
         updated_at = new_state.get("updated_at", "不明")
+        dlog("UI_BTN", f"机上スキャン完了 ({elapsed:.2f}秒) | 物体数: {obj_count}個 | 最終更新: {updated_at}", "OK" if success else "WARN")
 
         content = f"📸 **机上スキャン実行結果**\n• {msg}\n• 認識物体数: `{obj_count}` 個 (最終更新: `{updated_at}`)"
 
@@ -220,19 +242,24 @@ class SystemControlView(View):
         if jpeg_bytes:
             file = discord.File(io.BytesIO(jpeg_bytes), filename="tabletop_snapshot.jpg")
             await interaction.followup.send(content=content, file=file)
+            dlog("UI_BTN", f"スナップショット画像送信完了 ({len(jpeg_bytes)} bytes)", "INFO")
         else:
             await interaction.followup.send(content=f"{content}\n⚠️ 画像の取得に失敗しました: {snap_err}")
+            dlog("UI_BTN", f"画像取得失敗: {snap_err}", "WARN")
 
     @discord.ui.button(label="🧠 AI診断", style=discord.ButtonStyle.primary, custom_id="sys_ai_diag", row=0)
     async def ai_diagnosis(self, interaction: discord.Interaction, button: Button):
-        dlog("UI_BTN", f"[🧠 AI診断] 押下 (User: {interaction.user})", "INFO")
+        dlog("UI_BTN", f"[🧠 AI診断] 押下 (ユーザー: {interaction.user})", "STEP")
         await interaction.response.send_message(
             "🧠 **AIセキュリティ診断を開始しました。**\n"
             "7系統のシステムメトリクスを収集し、Gemini による解析を実行しています..."
         )
 
         async with interaction.channel.typing():
+            start_diag = time.perf_counter()
             success, diag_text, used_model, elapsed = await asyncio.to_thread(run_ai_security_diagnosis_sync)
+            total_elapsed = time.perf_counter() - start_diag
+            dlog("UI_BTN", f"AIセキュリティ診断完了 (推論: {elapsed:.2f}秒, 総所要: {total_elapsed:.2f}秒) [使用モデル: {used_model}]", "OK" if success else "ERR")
 
         embed = discord.Embed(
             title="🧠 Gemini システム・セキュリティ診断レポート",
@@ -245,32 +272,35 @@ class SystemControlView(View):
     @discord.ui.button(label="🛑 アーム", style=discord.ButtonStyle.danger, custom_id="sys_stop_arm", row=1)
     async def stop_arm(self, interaction: discord.Interaction, button: Button):
         global is_busy
-        dlog("UI_BTN", "[🛑 アーム] 緊急停止押下", "WARN")
+        dlog("UI_BTN", f"[🛑 アーム] 緊急停止押下 (ユーザー: {interaction.user})", "WARN")
         await interaction.response.defer()
         is_busy = False
 
         if orchestrator is not None:
             orchestrator.trigger_abort()
         success, msg = emergency_stop_arm(follower)
+        dlog("UI_BTN", f"アーム緊急停止完了: {msg}", "OK" if success else "ERR")
         await interaction.followup.send(f"🛑 **緊急停止実行**: {msg}")
 
     @discord.ui.button(label="🛑 Web", style=discord.ButtonStyle.danger, custom_id="sys_stop_service", row=1)
     async def stop_web_service(self, interaction: discord.Interaction, button: Button):
-        dlog("UI_BTN", f"[🛑 Web] サービス停止押下 ({DEFAULT_PROTECTED_SERVICE})", "WARN")
+        dlog("UI_BTN", f"[🛑 Web] サービス停止押下 ({DEFAULT_PROTECTED_SERVICE}) (ユーザー: {interaction.user})", "WARN")
         await interaction.response.defer()
         success, msg = await asyncio.to_thread(stop_service, DEFAULT_PROTECTED_SERVICE)
+        dlog("UI_BTN", f"Webサービス停止完了: {msg}", "OK" if success else "ERR")
         await interaction.followup.send(msg)
 
     @discord.ui.button(label="▶️ Web", style=discord.ButtonStyle.success, custom_id="sys_start_service", row=1)
     async def start_web_service(self, interaction: discord.Interaction, button: Button):
-        dlog("UI_BTN", f"[▶️ Web] サービス再開押下 ({DEFAULT_PROTECTED_SERVICE})", "INFO")
+        dlog("UI_BTN", f"[▶️ Web] サービス再開押下 ({DEFAULT_PROTECTED_SERVICE}) (ユーザー: {interaction.user})", "INFO")
         await interaction.response.defer()
         success, msg = await asyncio.to_thread(start_service, DEFAULT_PROTECTED_SERVICE)
+        dlog("UI_BTN", f"Webサービス再開完了: {msg}", "OK" if success else "ERR")
         await interaction.followup.send(msg)
 
     @discord.ui.button(label="🔌 外部隔離", style=discord.ButtonStyle.secondary, custom_id="sys_isolate_net", row=2)
     async def isolate_net(self, interaction: discord.Interaction, button: Button):
-        dlog("UI_BTN", "[🔌 外部隔離] 押下", "WARN")
+        dlog("UI_BTN", f"[🔌 外部隔離] 押下 (ユーザー: {interaction.user})", "WARN")
         await interaction.response.defer()
         await interaction.followup.send(
             "🚨 **3秒後に Tailscale VPN を切断し、外部ネットワークから完全隔離します。**\n"
@@ -294,9 +324,11 @@ async def security_monitor_task():
     if channel is None:
         return
 
+    dlog("SENTINEL_LOOP", "定期セキュリティ監視スキャン実行中...", "DEBUG")
     warnings, auto_actions = await asyncio.to_thread(check_system_security_sync)
 
     if auto_actions:
+        dlog("SENTINEL_LOOP", f"🚨 自動防衛発動: {auto_actions}", "ERR")
         embed = discord.Embed(
             title="🚨 【自動防衛発動】不審な挙動を検知・自動停止しました",
             description="\n\n".join(auto_actions),
@@ -308,6 +340,7 @@ async def security_monitor_task():
         return
 
     if warnings and (time.time() - last_alert_time > ALERT_COOLDOWN_SEC):
+        dlog("SENTINEL_LOOP", f"⚠️ 警告検知: {warnings}", "WARN")
         embed = discord.Embed(
             title="⚠️ システム・セキュリティ警告",
             description="\n".join(warnings),
@@ -316,6 +349,8 @@ async def security_monitor_task():
         embed.set_footer(text="異常がある場合は下のパネルから手動で緊急停止やAI診断を実行できます。")
         await channel.send(embed=embed, view=SystemControlView())
         last_alert_time = time.time()
+    else:
+        dlog("SENTINEL_LOOP", "システム正常 (異常検知なし)", "DEBUG")
 
 
 # ==============================================================================
@@ -365,14 +400,17 @@ class TaskConfirmView(View):
     async def confirm(self, interaction: discord.Interaction, button: Button):
         global is_busy
         if interaction.user.id != self.user_id:
+            dlog("TASK_CONFIRM", f"実行拒絶: 操作者不一致 (Req: {interaction.user.id}, Owner: {self.user_id})", "WARN")
             await interaction.response.send_message("❌ 指示を出した本人のみ操作できます。", ephemeral=True)
             return
 
         if is_busy:
+            dlog("TASK_CONFIRM", "実行拒絶: 他のタスクが稼働中 (is_busy=True)", "WARN")
             await interaction.response.send_message("⚠️ 現在別のアクションを実行中です。", ephemeral=True)
             return
 
         if orchestrator is None:
+            dlog("TASK_CONFIRM", "実行拒絶: オーケストレーター未初期化", "ERR")
             await interaction.response.send_message("⚠️ オーケストレーターがロードされていません。", ephemeral=True)
             return
 
@@ -387,6 +425,9 @@ class TaskConfirmView(View):
             view=self,
         )
 
+        dlog("TASK_EXEC", f"ユーザー承認受領: 搬送シーケンス開始 (対象CSV数: {len(self.preview_csvs)})", "STEP")
+        start_exec = time.perf_counter()
+
         # 司令塔 orchestrator に実行を委譲 (完了後に自動机上再スキャン)
         all_ok, exec_logs, updated_state = await asyncio.to_thread(
             orchestrator.execute_approved_plan,
@@ -394,6 +435,11 @@ class TaskConfirmView(View):
             True
         )
         is_busy = False
+        elapsed_exec = time.perf_counter() - start_exec
+
+        dlog("TASK_EXEC", f"搬送シーケンス終了 ({elapsed_exec:.2f}秒) | 結果: {'成功' if all_ok else '異常あり'}", "OK" if all_ok else "ERR")
+        for l in exec_logs:
+            dlog("TASK_EXEC", f"  └ {l}", "DEBUG")
 
         status_icon = "✅" if all_ok else "⚠️"
         result_embed = discord.Embed(
@@ -410,6 +456,7 @@ class TaskConfirmView(View):
             await interaction.response.send_message("❌ 指示を出した本人のみ操作できます。", ephemeral=True)
             return
 
+        dlog("TASK_CONFIRM", f"ユーザーによりタスクがキャンセルされました (User: {interaction.user})", "WARN")
         await interaction.response.defer()
         if orchestrator is not None:
             orchestrator.pending_plan = None
@@ -449,17 +496,19 @@ async def on_message(message: discord.Message):
     if not user_text:
         return
 
-    dlog("DISCORD_MSG", f"受信 [{message.channel} / {message.author}]: {user_text}", "INFO")
+    dlog("DISCORD_MSG", f"受信 [Ch: {message.channel} / Author: {message.author}]: \"{user_text}\"", "INFO")
 
     try:
         # コントロールパネルの表示要求
         if user_text in ("!control", "!status"):
+            dlog("CMD", f"ステータスパネル表示要求: {user_text}", "STEP")
             embed = await asyncio.to_thread(build_status_embed_sync)
             await message.reply(embed=embed, view=SystemControlView())
             return
 
         # 緊急停止コマンド
         if user_text in ("!stop", "!abort"):
+            dlog("CMD", f"緊急停止コマンド受信: {user_text}", "WARN")
             is_busy = False
             if orchestrator is not None:
                 orchestrator.trigger_abort()
@@ -469,41 +518,56 @@ async def on_message(message: discord.Message):
 
         # 机上強制再スキャンコマンド
         if user_text == "!scan":
+            dlog("CMD", "机上強制再スキャンコマンド受信 (!scan)", "STEP")
             async with message.channel.typing():
                 if orchestrator is None:
+                    dlog("CMD", "オーケストレーター未初期化のため中断", "WARN")
                     await message.reply("⚠️ オーケストレーターが初期化されていません。")
                     return
+                scan_start = time.perf_counter()
                 success, new_state, scan_msg = await asyncio.to_thread(orchestrator.refresh_vision, None, True)
-                await message.reply(f"📸 **机上スキャン完了**: {scan_msg} (物体数: `{new_state.get('total_objects', 0)}`)")
+                scan_elapsed = time.perf_counter() - scan_start
+                total_objs = new_state.get('total_objects', 0)
+                dlog("CMD", f"強制再スキャン完了 ({scan_elapsed:.2f}秒) | 検出物体数: {total_objs}個", "OK" if success else "WARN")
+                await message.reply(f"📸 **机上スキャン完了**: {scan_msg} (物体数: `{total_objs}`)")
             return
 
         if is_busy:
+            dlog("DISCORD_MSG", "ビジー状態のため指示受付をブロック", "WARN")
             await message.reply("⚠️ 現在タスク実行中です。緊急停止したい場合は `!stop` または `!control` を使用してください。")
             return
 
         if orchestrator is None:
+            dlog("DISCORD_MSG", "オーケストレーター未初期化", "ERR")
             await message.reply("⚠️ オーケストレーターが初期化されていません。")
             return
 
         # 司令塔 orchestrator に指示を丸ごと委譲
         async with message.channel.typing():
+            dlog("DISCORD_MSG", "物理コンテキスト生成および指示拡張中...", "DEBUG")
             hw_context = await asyncio.to_thread(get_hardware_and_world_context)
             augmented_instruction = f"{hw_context}\n\n[ユーザーの発話]:\n{user_text}"
 
+            start_proc = time.perf_counter()
             res = await asyncio.to_thread(orchestrator.process_instruction, augmented_instruction, True)
+            elapsed_proc = time.perf_counter() - start_proc
 
             reply_text = res.get("reply_text", "了解いたしました！")
             tasks_list = res.get("tasks") or []
             ik_feasible = res.get("ik_feasible", True)
             preview_csvs = res.get("preview_csvs", [])
 
+            dlog("DISCORD_MSG", f"オーケストレーター処理完了 ({elapsed_proc:.2f}秒) | サブタスク: {len(tasks_list)}件 | IK到達性: {ik_feasible}", "OK")
+
             # 物理動作を伴わない雑談・質問の場合
             if not tasks_list:
+                dlog("DISCORD_MSG", f"雑談・会話返答を送信: \"{reply_text[:60]}...\"", "INFO")
                 await message.reply(f"💬 **TACHIKOMA:** {reply_text}")
                 return
 
             # IK 幾何学的解が見つからなかった場合
             if not ik_feasible:
+                dlog("DISCORD_MSG", "IK 解探索不成立のため警告文を送信", "WARN")
                 await message.reply(f"💬 **TACHIKOMA:** {reply_text}")
                 return
 
@@ -537,6 +601,7 @@ async def on_message(message: discord.Message):
                 csv_names = [f"`{os.path.basename(p)}`" for p in preview_csvs]
                 embed.add_field(name="📄 検証用モーションCSV", value=", ".join(csv_names), inline=False)
 
+            dlog("DISCORD_MSG", f"実行承認パネル (TaskConfirmView) を送信 (ユーザー: {message.author})", "INFO")
             view = TaskConfirmView(user_id=message.author.id, preview_csvs=preview_csvs)
             await message.reply(embed=embed, view=view)
 
