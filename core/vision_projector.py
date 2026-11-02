@@ -82,9 +82,16 @@ class VisionProjector:
     def detect_markers(self, image: np.ndarray) -> Dict[int, np.ndarray]:
         """画像中からマーカーを検出し、{ID: 中心ピクセル(u, v)} を取得"""
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        if self.detector is not None:
-            corners, ids, _ = self.detector.detectMarkers(gray)
+
+        # OpenCV 4.7+ の ArucoDetector を最優先で利用
+        if hasattr(cv2.aruco, "ArucoDetector"):
+            detector = getattr(self, "detector", None)
+            if detector is None:
+                detector = cv2.aruco.ArucoDetector(self.aruco_dict, self.parameters)
+                self.detector = detector
+            corners, ids, _ = detector.detectMarkers(gray)
         else:
+            # OpenCV 4.6 以前のレガシー API
             corners, ids, _ = cv2.aruco.detectMarkers(gray, self.aruco_dict, parameters=self.parameters)
 
         centers = {}
