@@ -48,6 +48,7 @@ import argparse
 import csv
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple, Any
+import json
 
 import matplotlib
 matplotlib.use("Agg")
@@ -191,7 +192,87 @@ def parse_motion_csv(csv_path: str) -> List[np.ndarray]:
             points.append(tcp)
 
     return points
+"""
+現在のWorld Stateを読み込む関数
+"""
+WORLD_STATE_PATH = os.path.join(BASE_DIR, "config", "current_world_state.json")
 
+def load_world_state_objects(json_path: Optional[str] = None) -> List[Dict[str, Any]]:
+    """config/current_world_state.json から認識済み物体リストを取得"""
+    target_path = json_path or WORLD_STATE_PATH
+    if not os.path.exists(target_path):
+        return []
+    try:
+        with open(target_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data.get("objects", [])
+    except Exception as e:
+        print(f"⚠️ [Visualizer] world_state 読み込み例外: {e}")
+        return []
+
+def draw_world_objects(ax, objects: List[Dict[str, Any]]):
+    """3D空間上に認識物体の回転バウンディングボックスと名称ラベルを描画"""
+    for obj in objects:
+        obj_id = obj.get("id", 0)
+        name = obj.get("display_name") or obj.get("name") or f"object_{obj_id}"
+        x = float(obj.get("x_mm", 200.0))
+        y = float(obj.get("y_mm", 0.0))
+        z = float(obj.get("z_mm", 5.0))
+        
+        # 寸法と回転角度 (deg)
+        phys = obj.get("physical", {})
+        size = phys.get("size_mm", [30.0, 30.0])
+        length = float(size[0])  # 長軸
+        width = float(size[1])   # 短軸
+        height = 20.0            # 表示上の直方体の高さ (mm)
+        angle_rad = math.radians(float(phys.get("angle_deg", 0.0)))
+
+        # 回転を考慮したローカル 4頂点 (2D)
+        dx = length / 2.0
+        dy = width / 2.0
+        local_corners = np.array([
+            [-dx, -dy],
+            [ dx, -dy],
+            [ dx,  dy],
+            [-dx,  dy],
+            [-dx, -dy]
+        ])
+
+        # 2D回転行列
+        c = math.cos(angle_rad)
+        s = math.sin(angle_rad)
+        R = np.array([[c, -s], [s, c]])
+        rotated_corners = (R @ local_corners.T).T
+
+        gx = x + rotated_corners[:, 0]
+        gy = y + rotated_corners[:, 1]
+        gz_bottom = np.full_like(gx, 0.0)
+        gz_top = np.full_like(gx, height)
+
+        # 1. 底面枠・天面枠 (オレンジ/ゴールドの境界線)
+        ax.plot(gx, gy, gz_bottom, color="#f39c12", linestyle="--", linewidth=1.5, zorder=5)
+        ax.plot(gx, gy, gz_top, color="#f1c40f", linestyle="-", linewidth=1.8, zorder=6)
+
+        # 2. 側面の柱 (4本)
+        for i in range(4):
+            ax.plot([gx[i], gx[i]], [gy[i], gy[i]], [0.0, height], color="#f39c12", linestyle=":", linewidth=1.2, zorder=5)
+
+        # 3. 中心点マーカー
+        ax.scatter([x], [y], [height / 2.0], color="#e67e22", s=40, edgecolors="white", linewidth=1.0, zorder=7)
+
+        # 4. 物体名称ラベルタグ (背景ボックス付き)
+        label_text = f"#{obj_id:02d} {name}"
+        ax.text(
+            x, y, height + 12.0,
+            label_text,
+            color="#ffffff",
+            fontsize=9,
+            fontweight="bold",
+            ha="center",
+            va="bottom",
+            bbox=dict(boxstyle="round,pad=0.25", facecolor="#2c3e50", edgecolor="#f1c40f", alpha=0.85, lw=1.2),
+            zorder=10
+        )
 
 # ==============================================================================
 # 2. VisionProjector による厳密正射影 ＆ 物理座標連動
@@ -283,7 +364,8 @@ def find_pick_and_place_indices(zs: np.ndarray) -> Tuple[int, int]:
 def render_preview_image(
     image_path: Optional[str] = None,
     csv_path: Optional[str] = None,
-    output_path: Optional[str] = None
+    output_path: Optional[str] = None,
+    world_state_path: Optional[str] = None
 ) -> str:
     start_t = time.perf_counter()
 
@@ -325,6 +407,11 @@ def render_preview_image(
         Z = np.zeros_like(X)
         ax.plot_wireframe(X, Y, Z, color="#34495e", linewidth=0.8, alpha=0.6, zorder=1)
 
+    # 4.5. World State 認識物体の重畳描画
+    objects = load_world_state_objects(world_state_path)
+    if objects:
+        draw_world_objects(ax, objects)
+
     # 5. 3次元爪先軌道のプロット
     if len(pts) > 1:
         xs = np.array([p[0] for p in pts])
@@ -355,17 +442,27 @@ def render_preview_image(
     ax.text(0, 0, 8, "Arm Base (0,0)", color="#c8d6e5", fontsize=8, zorder=4)
 
     # 7. 表示範囲・アングル調整 (400x400mm ワークスペース全体をカバー)
-    ax.set_xlim(0, 600)
-    ax.set_ylim(-320, 260)
-    ax.set_zlim(0, 240)
+    x_range = [0, 600]
+    y_range = [-320, 260]
+    z_range = [0, 240]
+
+    ax.set_xlim(x_range)
+    ax.set_ylim(y_range)
+    ax.set_zlim(z_range)
+
+    # 👉 X, Y, Z の実寸法比 (1:1:1) をボックスアスペクト比に反映
+    dx = x_range[1] - x_range[0]  # 600 mm
+    dy = y_range[1] - y_range[0]  # 580 mm
+    dz = z_range[1] - z_range[0]  # 240 mm
+    ax.set_box_aspect((dx, dy, dz))
 
     ax.set_xlabel("X (Forward) [mm]", color="#c8d6e5", labelpad=12)
     ax.set_ylabel("Y (Lateral) [mm]", color="#c8d6e5", labelpad=12)
     ax.set_zlabel("Z (Height) [mm]", color="#c8d6e5", labelpad=8)
     ax.tick_params(colors="#8395a7", labelsize=8)
 
-    # 見晴らしの良い鳥瞰アングル (仰角 34度、方位角 -58度)
-    ax.view_init(elev=34, azim=-58)
+    # 見晴らしの良い鳥瞰アングル (仰角、方位角)
+    ax.view_init(elev=25, azim=-58)
 
     elapsed_sec = time.perf_counter() - start_t
     ts_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -393,6 +490,7 @@ if __name__ == "__main__":
     parser.add_argument("--image", type=str, default=None, help="生カメラ画像パス")
     parser.add_argument("--csv", type=str, default=None, help="モーション CSV パス")
     parser.add_argument("--out", type=str, default=None, help="出力先画像パス")
+    parser.add_argument("--world-state", type=str, default=None, help="current_world_state.json パス (省略時は config/ から自動読み込み)")
     args = parser.parse_args()
 
     img_path = args.image

@@ -57,14 +57,14 @@ from config.joint_config import (
     SERVO_IDS,
     JOINT_CONFIG
 )
-from core.sts3215 import STS3215Driver
+from drivers.sts3215 import STS3215Driver
 from core.sim_viewer import MujocoSimViewer
 from core.vision_projector import VisionProjector
 from core.tabletop_detector import TabletopDetector
 from core.multimodal_tagger import MultimodalTagger
 from core.llm_planner import LLMTaskPlanner
 from core.trajectory_executor import TrajectoryExecutor
-from core.kinematics import (
+from services.arm_worker.kinematics import (
     get_home_radians,
     solve_ik_tabletop_grasp,
     solve_ik_tabletop_place,
@@ -76,7 +76,7 @@ from core.kinematics import (
 )
 
 try:
-    from core.bus_servo_controller import BusServoController
+    from drivers.bus_servo_controller import BusServoController
     HAS_HARDWARE_MODULE = True
 except ImportError:
     HAS_HARDWARE_MODULE = False
